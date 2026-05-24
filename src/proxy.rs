@@ -313,7 +313,7 @@ const LIGHTWEIGHT_HINTS: &[&str] = &[
     "fast_chat",
 ];
 
-const FREE_LONGCAT_TEXT_PATTERNS: &[&str] = &[
+const FREE_LONGCAT_LATEST_TEXT_PATTERNS: &[&str] = &[
     "heartbeat.md",
     "heartbeat agent",
     "heartbeat tool",
@@ -321,9 +321,19 @@ const FREE_LONGCAT_TEXT_PATTERNS: &[&str] = &[
     "\"name\": \"heartbeat\"",
 ];
 
+const FREE_LONGCAT_TASK_TEXT_PATTERNS: &[&str] = &[
+    "extract key facts from this conversation",
+    "only output items matching these categories",
+    "output as concise bullet points",
+];
+
 const CHANNEL_COOLDOWN_SECS: u64 = 120;
 
-fn free_longcat_trigger(hints: &RouteHints, routing_text: &str) -> Option<String> {
+fn free_longcat_trigger(
+    hints: &RouteHints,
+    latest_routing_text: &str,
+    task_routing_text: &str,
+) -> Option<String> {
     for (label, value) in [
         ("purpose", hints.purpose.as_str()),
         ("intent", hints.intent.as_str()),
@@ -335,9 +345,15 @@ fn free_longcat_trigger(hints: &RouteHints, routing_text: &str) -> Option<String
             return Some(format!("{} hint matched: {}", label, value));
         }
     }
-    FREE_LONGCAT_TEXT_PATTERNS
+    if let Some(pattern) = FREE_LONGCAT_LATEST_TEXT_PATTERNS
         .iter()
-        .find(|pattern| routing_text.contains(**pattern))
+        .find(|pattern| latest_routing_text.contains(**pattern))
+    {
+        return Some((*pattern).to_string());
+    }
+    FREE_LONGCAT_TASK_TEXT_PATTERNS
+        .iter()
+        .find(|pattern| task_routing_text.contains(**pattern))
         .map(|pattern| (*pattern).to_string())
 }
 
@@ -918,7 +934,12 @@ fn route_decision(
         .map(extract_routing_text)
         .unwrap_or_default()
         .to_lowercase();
-    if let Some(pattern) = free_longcat_trigger(hints, &free_routing_text) {
+    let free_task_routing_text = request_json
+        .map(extract_free_task_routing_text)
+        .unwrap_or_default()
+        .to_lowercase();
+    if let Some(pattern) = free_longcat_trigger(hints, &free_routing_text, &free_task_routing_text)
+    {
         let mut decision = RouteDecision {
             requested_model: requested_model.to_string(),
             desired_model: router.emergency_model.clone(),
@@ -2006,6 +2027,28 @@ fn extract_routing_text(value: &Value) -> String {
     extract_text(value)
 }
 
+fn extract_free_task_routing_text(value: &Value) -> String {
+    if let Some(messages) = value.get("messages").and_then(Value::as_array) {
+        let mut parts = Vec::new();
+        if let Some(message) = messages
+            .iter()
+            .rev()
+            .find(|message| message_role_is(message, "system"))
+        {
+            parts.push(message_content_text(message));
+        }
+        if let Some(message) = messages
+            .iter()
+            .rev()
+            .find(|message| message_role_is(message, "user"))
+        {
+            parts.push(message_content_text(message));
+        }
+        return parts.join("\n");
+    }
+    extract_routing_text(value)
+}
+
 fn message_role_is(message: &Value, expected: &str) -> bool {
     message
         .get("role")
@@ -2136,6 +2179,34 @@ mod tests {
         assert_eq!(decision.role, "emergency");
         assert_eq!(decision.group, "longcat");
         assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
+    }
+
+    #[test]
+    fn replay_window_consolidation_routes_to_longcat() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "Extract key facts from this conversation. Only output items matching these categories, skip everything else. Output as concise bullet points."
+                },
+                {"role": "user", "content": "[user] Work stress and producer role."}
+            ]
+        });
+        let decision = route_decision(
+            &router,
+            &UsageStats::default(),
+            Some(&body),
+            "deepseek-v4-flash",
+            &RouteHints::default(),
+        );
+
+        assert_eq!(decision.role, "emergency");
+        assert_eq!(decision.group, "longcat");
+        assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
+        assert!(decision.reason.contains("extract key facts"));
     }
 
     #[test]
