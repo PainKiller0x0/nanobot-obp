@@ -213,8 +213,7 @@ async fn acquire_serial_permit(
 }
 
 fn requires_serial_channel(channel: &Channel) -> bool {
-    let configured = env::var("OBP_SERIAL_CHANNELS")
-        .unwrap_or_else(|_| "gemini web fastapi,127.0.0.1:18080".to_string());
+    let configured = env::var("OBP_SERIAL_CHANNELS").unwrap_or_default();
     let haystack = format!(
         "{} {} {} {}",
         channel.name, channel.group, channel.base, channel.models
@@ -2116,6 +2115,27 @@ mod tests {
         assert_eq!(decision.role, "default");
         assert_eq!(decision.group, "gemini");
         assert_eq!(decision.desired_model, "gemini-flash");
+    }
+
+    #[test]
+    fn gemini_profile_keeps_free_heartbeat_on_longcat() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let body = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [{"role": "user", "content": "heartbeat.md"}]
+        });
+        let decision = route_decision(
+            &router,
+            &UsageStats::default(),
+            Some(&body),
+            "deepseek-v4-flash",
+            &RouteHints::default(),
+        );
+
+        assert_eq!(decision.role, "emergency");
+        assert_eq!(decision.group, "longcat");
+        assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
     }
 
     #[test]
