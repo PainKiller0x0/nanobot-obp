@@ -1,0 +1,95 @@
+{
+  "enabled": true,
+  "dry_run": false,
+  "external_enabled": true,
+  "external_allowed_models": [
+    "deepseek-v4-flash",
+    "deepseek-v4-pro",
+    "MiniMax-M2.7",
+    "LongCat-Flash-Chat",
+    "gemini-flash",
+    "gemini-pro",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro"
+  ],
+  "default_model": "deepseek-v4-flash",
+  "pro_model": "deepseek-v4-pro",
+  "emergency_model": "LongCat-Flash-Chat",
+  "backup_model": "MiniMax-M2.7",
+  "default_group": "deepseek",
+  "pro_group": "deepseek",
+  "emergency_group": "longcat",
+  "backup_group": "minimax",
+  "default_alias_models": [
+    "deepseek-v4-flash",
+    "gpt-4o-mini",
+    "gpt-3.5-turbo"
+  ],
+  "pro_alias_models": [
+    "deepseek-v4-pro",
+    "deepseek-reasoner",
+    "gpt-4o"
+  ],
+  "route_profiles": {
+    "default": {
+      "default_model": "deepseek-v4-flash",
+      "pro_model": "deepseek-v4-pro",
+      "emergency_model": "LongCat-Flash-Chat",
+      "backup_model": "MiniMax-M2.7",
+      "default_group": "deepseek",
+      "pro_group": "deepseek",
+      "emergency_group": "longcat",
+      "backup_group": "minimax"
+    },
+    "gemini": {
+      "default_model": "gemini-flash",
+      "pro_model": "gemini-pro",
+      "emergency_model": "gemini-flash",
+      "backup_model": "gemini-flash",
+      "default_group": "gemini",
+      "pro_group": "gemini",
+      "emergency_group": "gemini",
+      "backup_group": "gemini"
+    }
+  },
+  "source_route_profiles": {
+    "default-nanobot": "gemini",
+    "guangzhou-nanobot": "default"
+  },
+  "pro_prompt_chars": 0,
+  "pro_message_count": 0,
+  "monthly_warn_rmb": 10.0,
+  "monthly_downgrade_rmb": 20.0,
+  "monthly_hard_limit_rmb": 30.0,
+  "retry_statuses": [
+    408,
+    409,
+    425,
+    429,
+    500,
+    502,
+    503,
+    504,
+    529
+  ],
+  "pro_keywords": [
+    "深度分析",
+    "深入分析",
+    "架构",
+    "architecture",
+    "review",
+    "code review",
+    "代码审查",
+    "重构",
+    "refactor",
+    "取舍",
+    "迁移",
+    "migration",
+    "全盘",
+    "排障",
+    "root cause",
+    "压缩",
+    "上下文压缩",
+    "反思"
+  ]
+}

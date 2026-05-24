@@ -1,0 +1,18 @@
+# Rust build output
+/target/
+
+# Runtime data and secrets
+/data/*
+!/data/.gitkeep
+!/data/*.example.json
+/backups/
+
+# Local env / logs / backups
+.env
+.env.*
+!.env.example
+*.log
+*.bak
+*.bak.*
+*.tmp
+.DS_Store

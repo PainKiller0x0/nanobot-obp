@@ -1,0 +1,22 @@
+[Unit]
+Description=OBP Rust Gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/nanobot-obp
+Environment=OBP_HOST=127.0.0.1
+Environment=OBP_PORT=8000
+Environment=OBP_CONFIG_PATH=/opt/nanobot-obp/data/config.json
+Environment=OBP_ROUTER_PATH=/opt/nanobot-obp/data/router.json
+Environment=OBP_STATS_PATH=/opt/nanobot-obp/data/stats.json
+Environment=OBP_SERIAL_CHANNELS=gemini web fastapi,127.0.0.1:18080
+Environment=OBP_SERIAL_CHANNEL_WAIT_MS=45000
+ExecStart=/usr/local/bin/obp-rs
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target
