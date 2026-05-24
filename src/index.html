@@ -127,8 +127,8 @@
             <template x-for="log in logs.slice().reverse()" :key="log.ts + log.channel + log.model + log.latency_ms">
               <div class="rounded-xl border border-stone-200 dark:border-slate-800 bg-stone-50 dark:bg-slate-950 p-3">
                 <div class="flex justify-between gap-2 text-xs"><span class="mono text-slate-500" x-text="log.time"></span><span :class="String(log.status).startsWith('2')?'text-emerald-600':'text-rose-600'" x-text="log.status"></span></div>
-                <div class="mt-1 font-bold" x-text="(log.requested_model||log.model) + ' → ' + log.model + ' / ' + log.route"></div>
-                <div class="text-xs text-slate-500 mt-1" x-text="(log.source||'unknown-source') + ' / ' + log.channel + ' / ' + (log.route_reason||'-')"></div>
+                <div class="mt-1 font-bold" x-text="routeTitle(log)"></div>
+                <div class="text-xs text-slate-500 mt-1" x-text="routeMeta(log)"></div>
                 <div class="text-xs text-slate-500 mt-1" x-text="'耗时 ' + (log.first_chunk_ms ? ('首字 ' + fmt(log.first_chunk_ms) + 'ms / ') : '') + '总 ' + fmt(log.latency_ms) + 'ms'"></div>
                 <div class="text-xs text-slate-500 mt-1" x-text="'tokens ' + fmt(log.total_tokens) + ' / 缓存 ' + fmt(log.cached_tokens) + ' / 成本 ' + money(log.cost_cny)"></div>
               </div>
@@ -320,6 +320,8 @@
       splitList(s){return String(s||'').split(/[，,;；\n]+/).map(x=>x.trim()).filter(Boolean)},
       fmt(v){return new Intl.NumberFormat('zh-CN').format(Math.round(Number(v||0)))},
       money(v){return '¥'+Number(v||0).toFixed(4)},
+      routeTitle(log){const requested=log.requested_model||log.model||'-';const actual=log.model||'-';const route=log.route||'-';return '请求 '+requested+' → 实际 '+actual+' / 路由 '+route},
+      routeMeta(log){return '来源 '+(log.source||'unknown-source')+' / 渠道 '+(log.channel||'-')+' / 原因 '+(log.route_reason||'-')},
       bucketList(map){return Object.entries(map||{}).map(([name,b])=>({name,...b})).sort((a,b)=>(b.cost_cny||0)-(a.cost_cny||0)||((b.requests||0)-(a.requests||0))).slice(0,8)},
       async copy(t){try{if(navigator.clipboard&&window.isSecureContext){await navigator.clipboard.writeText(t)}else{const ta=document.createElement('textarea');ta.value=t;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.focus();ta.select();document.execCommand('copy');ta.remove()}this.help('已复制到剪贴板')}catch(e){this.help('复制失败，可以手动选中后复制')}},
       help(t){this.notice=t;clearTimeout(this._noticeTimer);this._noticeTimer=setTimeout(()=>this.notice='',4200)},
