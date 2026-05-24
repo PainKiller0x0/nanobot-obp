@@ -1,4 +1,4 @@
-use crate::config::{save_config, Channel, RouterConfig};
+use crate::config::{save_config, Channel, RouteRule, RouterConfig};
 use crate::stats::{save_stats, RequestLog, TokenUsage, UsageStats};
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -60,6 +60,7 @@ struct Attempt {
     role: String,
     group: String,
     reason: String,
+    stage: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -445,6 +446,7 @@ async fn handle_proxy(
     let request_id = request_id(&parts.headers, request_json.as_ref());
 
     let router = state.router.lock().await.clone().normalized();
+    let route_profile = router.profile_name_for_source(&source);
     let effective_router = router.effective_for_source(&source);
     if !router.external_enabled {
         return error_response(StatusCode::FORBIDDEN, "external_access_disabled");
@@ -467,6 +469,7 @@ async fn handle_proxy(
         request_json.as_ref(),
         &requested_model,
         &route_hints,
+        &source,
     );
     let attempts = build_attempts(&state, &channels, &effective_router, &decision, protocol).await;
     if attempts.is_empty() {
@@ -510,6 +513,7 @@ async fn handle_proxy(
                     TokenUsage::default(),
                     &source,
                     &request_id,
+                    &attempt.stage,
                 )
                 .await;
                 continue;
@@ -556,6 +560,7 @@ async fn handle_proxy(
                     TokenUsage::default(),
                     &source,
                     &request_id,
+                    &attempt.stage,
                 )
                 .await;
                 continue;
@@ -581,6 +586,7 @@ async fn handle_proxy(
                     TokenUsage::default(),
                     &source,
                     &request_id,
+                    &attempt.stage,
                 )
                 .await;
                 continue;
@@ -601,6 +607,7 @@ async fn handle_proxy(
                     TokenUsage::default(),
                     &source,
                     &request_id,
+                    &attempt.stage,
                     probe.first_chunk_ms,
                     probe.first_text_ms,
                 )
@@ -623,6 +630,7 @@ async fn handle_proxy(
                     TokenUsage::default(),
                     &source,
                     &request_id,
+                    &attempt.stage,
                     probe.first_chunk_ms,
                     probe.first_text_ms,
                 )
@@ -641,6 +649,7 @@ async fn handle_proxy(
                 TokenUsage::default(),
                 &source,
                 &request_id,
+                &attempt.stage,
                 probe.first_chunk_ms,
                 probe.first_text_ms,
             )
@@ -652,6 +661,7 @@ async fn handle_proxy(
                 &decision,
                 &source,
                 &request_id,
+                &route_profile,
                 probe.first_chunk_ms,
                 probe.first_text_ms,
             );
@@ -686,6 +696,7 @@ async fn handle_proxy(
                     TokenUsage::default(),
                     &source,
                     &request_id,
+                    &attempt.stage,
                 )
                 .await;
                 continue;
@@ -706,6 +717,7 @@ async fn handle_proxy(
             usage,
             &source,
             &request_id,
+            &attempt.stage,
         )
         .await;
 
@@ -722,6 +734,7 @@ async fn handle_proxy(
             &decision,
             &source,
             &request_id,
+            &route_profile,
             None,
             None,
         );
@@ -919,6 +932,7 @@ fn route_decision(
     request_json: Option<&Value>,
     requested_model: &str,
     hints: &RouteHints,
+    source: &str,
 ) -> RouteDecision {
     if !router.enabled {
         return RouteDecision {
@@ -938,6 +952,17 @@ fn route_decision(
         .map(extract_free_task_routing_text)
         .unwrap_or_default()
         .to_lowercase();
+    if let Some(decision) = route_rule_decision(
+        router,
+        stats,
+        requested_model,
+        hints,
+        source,
+        &free_routing_text,
+        &free_task_routing_text,
+    ) {
+        return decision;
+    }
     if let Some(pattern) = free_longcat_trigger(hints, &free_routing_text, &free_task_routing_text)
     {
         let mut decision = RouteDecision {
@@ -1080,6 +1105,159 @@ fn route_decision(
     }
 
     decision
+}
+
+fn route_rule_decision(
+    router: &RouterConfig,
+    stats: &UsageStats,
+    requested_model: &str,
+    hints: &RouteHints,
+    source: &str,
+    latest_routing_text: &str,
+    task_routing_text: &str,
+) -> Option<RouteDecision> {
+    let monthly_cost = stats.current_month_cost();
+    let mut rules = router.route_rules.clone();
+    rules.sort_by_key(|rule| rule.priority);
+    for rule in rules.iter().filter(|rule| rule.enabled) {
+        let Some(hit) = route_rule_hit(
+            rule,
+            requested_model,
+            source,
+            hints,
+            latest_routing_text,
+            task_routing_text,
+            monthly_cost,
+        ) else {
+            continue;
+        };
+        let role = normalize_role(&rule.role);
+        let desired_model = if rule.model.trim().is_empty() {
+            model_for_role(router, &role).to_string()
+        } else {
+            rule.model.trim().to_string()
+        };
+        let group = if rule.group.trim().is_empty() {
+            group_for_role(router, &role)
+        } else {
+            rule.group.trim().to_lowercase()
+        };
+        let base_reason = if rule.reason.trim().is_empty() {
+            "route rule matched".to_string()
+        } else {
+            rule.reason.trim().to_string()
+        };
+        let mut decision = RouteDecision {
+            requested_model: requested_model.to_string(),
+            desired_model,
+            role,
+            group,
+            reason: format!("rule {}: {}; {}", rule.name, base_reason, hit),
+        };
+        if router.dry_run {
+            decision.reason = format!(
+                "dry-run: would use {}/{} because {}",
+                decision.role, decision.desired_model, decision.reason
+            );
+            decision.desired_model = requested_model.to_string();
+            decision.role = "any".to_string();
+            decision.group.clear();
+        }
+        return Some(decision);
+    }
+    None
+}
+
+fn route_rule_hit(
+    rule: &RouteRule,
+    requested_model: &str,
+    source: &str,
+    hints: &RouteHints,
+    latest_routing_text: &str,
+    task_routing_text: &str,
+    monthly_cost: f64,
+) -> Option<String> {
+    let mut hits = Vec::new();
+    if !rule.requested_models.is_empty() {
+        let requested = requested_model.trim().to_lowercase();
+        let matched = rule
+            .requested_models
+            .iter()
+            .any(|pattern| model_pattern_matches(pattern, &requested));
+        if !matched {
+            return None;
+        }
+        hits.push(format!("requested_model={}", requested_model));
+    }
+    if !rule.source_patterns.is_empty() {
+        let source_lc = source.trim().to_lowercase();
+        let matched = rule
+            .source_patterns
+            .iter()
+            .any(|pattern| wildcard_or_contains(pattern, &source_lc));
+        if !matched {
+            return None;
+        }
+        hits.push(format!("source={}", source));
+    }
+    if rule.min_monthly_cost_rmb > 0.0 {
+        if monthly_cost < rule.min_monthly_cost_rmb {
+            return None;
+        }
+        hits.push(format!("monthly_cost={:.2}", monthly_cost));
+    }
+    let hint_text = format!("{} {}", hints.purpose, hints.intent).to_lowercase();
+    if let Some(pattern) = first_matching_pattern(&rule.hint_patterns, &hint_text) {
+        hits.push(format!("hint={}", pattern));
+    }
+    if let Some(pattern) = first_matching_pattern(&rule.latest_text_patterns, latest_routing_text) {
+        hits.push(format!("latest_text={}", pattern));
+    }
+    if let Some(pattern) = first_matching_pattern(&rule.task_text_patterns, task_routing_text) {
+        hits.push(format!("task_text={}", pattern));
+    }
+    if let Some(pattern) = first_matching_pattern(&rule.any_text_patterns, latest_routing_text) {
+        hits.push(format!("text={}", pattern));
+    }
+    if hits.is_empty() {
+        None
+    } else {
+        Some(hits.join("; "))
+    }
+}
+
+fn normalize_role(role: &str) -> String {
+    let role = role.trim().to_lowercase();
+    if role.is_empty() {
+        "default".to_string()
+    } else {
+        role
+    }
+}
+
+fn first_matching_pattern<'a>(patterns: &'a [String], text: &str) -> Option<&'a str> {
+    if text.trim().is_empty() {
+        return None;
+    }
+    patterns
+        .iter()
+        .map(|pattern| pattern.trim())
+        .filter(|pattern| !pattern.is_empty())
+        .find(|pattern| wildcard_or_contains(pattern, text))
+}
+
+fn wildcard_or_contains(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.trim().to_lowercase();
+    if pattern.is_empty() {
+        return false;
+    }
+    if pattern == "*" {
+        return true;
+    }
+    if pattern.contains('*') {
+        return model_pattern_matches(&pattern, text);
+    }
+    text.contains(&pattern)
 }
 
 fn explicit_model_route(router: &RouterConfig, requested_model: &str) -> Option<RouteDecision> {
@@ -1236,6 +1414,7 @@ async fn build_attempts(
                 actual_model: actual,
                 role: spec.role.clone(),
                 group: spec.group.clone(),
+                stage: attempt_stage(&spec),
                 reason: if !spec.fallback
                     && spec.role == decision.role
                     && spec.group == decision.group
@@ -1256,6 +1435,17 @@ async fn build_attempts(
         }
     }
     attempts
+}
+
+fn attempt_stage(spec: &AttemptSpec) -> String {
+    if !spec.fallback {
+        return "primary".to_string();
+    }
+    if spec.group.is_empty() {
+        format!("fallback:{}", spec.role)
+    } else {
+        format!("fallback:{}/{}", spec.role, spec.group)
+    }
 }
 
 fn fallback_roles(role: &str) -> &'static [&'static str] {
@@ -1698,6 +1888,7 @@ fn route_headers(
     decision: &RouteDecision,
     source: &str,
     request_id: &str,
+    route_profile: &str,
     first_chunk_ms: Option<u64>,
     first_text_ms: Option<u64>,
 ) -> axum::http::response::Builder {
@@ -1708,6 +1899,8 @@ fn route_headers(
         ("x-obp-actual-model", attempt.actual_model.as_str()),
         ("x-obp-channel", attempt.channel.name.as_str()),
         ("x-obp-reason", attempt.reason.as_str()),
+        ("x-obp-fallback-stage", attempt.stage.as_str()),
+        ("x-obp-route-profile", route_profile),
         ("x-obp-source", source),
         ("x-obp-request-id", request_id),
     ];
@@ -1750,9 +1943,20 @@ async fn record_failure(
             TokenUsage::default(),
             source,
             request_id,
+            "failure",
         )
         .await;
     }
+}
+
+async fn route_profile_for_source(state: &Arc<ProxyState>, source: &str) -> String {
+    state
+        .router
+        .lock()
+        .await
+        .clone()
+        .normalized()
+        .profile_name_for_source(source)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1768,6 +1972,7 @@ async fn record_result(
     usage: TokenUsage,
     source: &str,
     request_id: &str,
+    route_stage: &str,
 ) {
     record_result_with_first_chunk(
         state,
@@ -1781,6 +1986,7 @@ async fn record_result(
         usage,
         source,
         request_id,
+        route_stage,
         None,
         None,
     )
@@ -1800,6 +2006,7 @@ async fn record_result_with_first_chunk(
     usage: TokenUsage,
     source: &str,
     request_id: &str,
+    route_stage: &str,
     first_chunk_ms: Option<u64>,
     first_text_ms: Option<u64>,
 ) {
@@ -1813,6 +2020,8 @@ async fn record_result_with_first_chunk(
         actual_model.to_string(),
         route.to_string(),
         route_reason.to_string(),
+        route_profile_for_source(state, source).await,
+        route_stage.to_string(),
         status,
         latency_ms,
         usage,
@@ -1865,6 +2074,8 @@ fn log_model_route(log: &RequestLog, ch: &Channel) {
             source = %log.source,
             channel = %log.channel,
             group = %group,
+            route_profile = %log.route_profile,
+            route_stage = %log.route_stage,
             requested_model = %log.requested_model,
             actual_model = %log.model,
             route = %log.route,
@@ -1877,6 +2088,7 @@ fn log_model_route(log: &RequestLog, ch: &Channel) {
             completion_tokens = log.completion_tokens,
             cost_cny = log.cost_cny,
             reason = %log.route_reason,
+            trace = %log.route_trace,
             "obp_model_route"
         );
     } else {
@@ -1887,6 +2099,8 @@ fn log_model_route(log: &RequestLog, ch: &Channel) {
             source = %log.source,
             channel = %log.channel,
             group = %group,
+            route_profile = %log.route_profile,
+            route_stage = %log.route_stage,
             requested_model = %log.requested_model,
             actual_model = %log.model,
             route = %log.route,
@@ -1899,6 +2113,7 @@ fn log_model_route(log: &RequestLog, ch: &Channel) {
             completion_tokens = log.completion_tokens,
             cost_cny = log.cost_cny,
             reason = %log.route_reason,
+            trace = %log.route_trace,
             "obp_model_route"
         );
     }
@@ -2104,6 +2319,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.role, "emergency");
@@ -2129,6 +2345,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.role, "default");
@@ -2153,6 +2370,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.role, "default");
@@ -2174,6 +2392,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.role, "emergency");
@@ -2201,6 +2420,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.role, "emergency");
@@ -2230,6 +2450,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.desired_model, "gemini-flash");
@@ -2250,6 +2471,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.desired_model, "deepseek-v4-flash");
@@ -2322,6 +2544,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-pro",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.role, "pro");
@@ -2345,6 +2568,7 @@ mod tests {
             Some(&body),
             "deepseek-v4-flash",
             &RouteHints::default(),
+            "default-nanobot",
         );
 
         assert_eq!(decision.role, "emergency");

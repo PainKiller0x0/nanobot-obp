@@ -163,6 +163,7 @@ async fn update_router(
     State(state): State<Arc<ProxyState>>,
     Json(router): Json<RouterConfig>,
 ) -> Json<RouterConfig> {
+    let router = router.normalized();
     let mut current = state.router.lock().await;
     *current = router.clone();
     save_router_config(&state.router_path, &router);

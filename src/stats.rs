@@ -83,8 +83,14 @@ pub struct RequestLog {
     pub channel_id: Option<u64>,
     pub requested_model: String,
     pub model: String,
+    #[serde(default = "default_route_profile")]
+    pub route_profile: String,
     pub route: String,
+    #[serde(default = "default_route_stage")]
+    pub route_stage: String,
     pub route_reason: String,
+    #[serde(default)]
+    pub route_trace: String,
     pub status: u16,
     pub latency_ms: u64,
     pub latency: String,
@@ -117,6 +123,8 @@ impl RequestLog {
         actual_model: String,
         route: String,
         route_reason: String,
+        route_profile: String,
+        route_stage: String,
         status: u16,
         latency_ms: u64,
         usage: TokenUsage,
@@ -127,19 +135,30 @@ impl RequestLog {
         let (day, time) = shanghai_strings(ts);
         let month = day.get(0..7).unwrap_or("").to_string();
         let cost_cny = estimate_cost_cny(&actual_model, usage);
+        let source = normalize_key(source, "unknown-source");
+        let route_profile = normalize_key(route_profile, "default");
+        let route_stage = normalize_key(route_stage, "primary");
+        let route = normalize_key(route, "default");
+        let route_trace = format!(
+            "source={} profile={} stage={} route={} reason={}",
+            source, route_profile, route_stage, route, route_reason
+        );
         Self {
             ts,
             day,
             month,
             time,
             request_id: normalize_key(request_id, "unknown-request"),
-            source: normalize_key(source, "unknown-source"),
+            source,
             channel,
             channel_id,
             requested_model: normalize_key(requested_model, "unknown"),
             model: normalize_key(actual_model, "unknown"),
-            route: normalize_key(route, "default"),
+            route_profile,
+            route,
+            route_stage,
             route_reason,
+            route_trace,
             status,
             latency_ms,
             latency: format!("{}ms", latency_ms),
@@ -661,6 +680,14 @@ fn default_source() -> String {
     "unknown-source".to_string()
 }
 
+fn default_route_profile() -> String {
+    "default".to_string()
+}
+
+fn default_route_stage() -> String {
+    "primary".to_string()
+}
+
 fn normalize_key(value: String, fallback: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -731,6 +758,8 @@ mod tests {
             "deepseek-v4-flash".to_string(),
             "default".to_string(),
             "test".to_string(),
+            "default".to_string(),
+            "primary".to_string(),
             200,
             100,
             usage(1_000, 100, 200),
@@ -746,6 +775,8 @@ mod tests {
             "LongCat-Flash-Chat".to_string(),
             "emergency".to_string(),
             "test".to_string(),
+            "default".to_string(),
+            "primary".to_string(),
             200,
             100,
             usage(2_000, 0, 100),

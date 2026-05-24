@@ -230,6 +230,46 @@ impl Default for RouteProfile {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
+pub struct RouteRule {
+    pub name: String,
+    pub enabled: bool,
+    pub priority: u32,
+    pub role: String,
+    pub model: String,
+    pub group: String,
+    pub reason: String,
+    pub requested_models: Vec<String>,
+    pub source_patterns: Vec<String>,
+    pub hint_patterns: Vec<String>,
+    pub latest_text_patterns: Vec<String>,
+    pub task_text_patterns: Vec<String>,
+    pub any_text_patterns: Vec<String>,
+    pub min_monthly_cost_rmb: f64,
+}
+
+impl Default for RouteRule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            priority: 100,
+            role: "default".to_string(),
+            model: String::new(),
+            group: String::new(),
+            reason: String::new(),
+            requested_models: Vec::new(),
+            source_patterns: Vec::new(),
+            hint_patterns: Vec::new(),
+            latest_text_patterns: Vec::new(),
+            task_text_patterns: Vec::new(),
+            any_text_patterns: Vec::new(),
+            min_monthly_cost_rmb: 0.0,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
 pub struct RouterConfig {
     pub enabled: bool,
     pub dry_run: bool,
@@ -249,6 +289,7 @@ pub struct RouterConfig {
     pub pro_alias_models: Vec<String>,
     pub route_profiles: BTreeMap<String, RouteProfile>,
     pub source_route_profiles: BTreeMap<String, String>,
+    pub route_rules: Vec<RouteRule>,
     // Legacy compatibility fields. Routing no longer upgrades to Pro only
     // because the prompt or message history is long.
     pub pro_prompt_chars: usize,
@@ -292,6 +333,7 @@ impl Default for RouterConfig {
             ],
             route_profiles: default_route_profiles(),
             source_route_profiles: default_source_route_profiles(),
+            route_rules: default_route_rules(),
             pro_prompt_chars: 0,
             pro_message_count: 0,
             monthly_warn_rmb: 10.0,
@@ -348,19 +390,24 @@ impl RouterConfig {
         if self.source_route_profiles.is_empty() {
             self.source_route_profiles = default_source_route_profiles();
         }
+        if self.route_rules.is_empty() {
+            self.route_rules = default_route_rules();
+        }
+    }
+
+    pub fn profile_name_for_source(&self, source: &str) -> String {
+        self.source_route_profiles
+            .get(source)
+            .or_else(|| self.source_route_profiles.get("*"))
+            .cloned()
+            .unwrap_or_else(|| "default".to_string())
     }
 
     pub fn effective_for_source(&self, source: &str) -> Self {
         let mut router = self.clone().normalized();
-        let profile_name = router
-            .source_route_profiles
-            .get(source)
-            .or_else(|| router.source_route_profiles.get("*"))
-            .cloned();
-        if let Some(profile_name) = profile_name {
-            if let Some(profile) = router.route_profiles.get(&profile_name).cloned() {
-                profile.apply_to(&mut router);
-            }
+        let profile_name = router.profile_name_for_source(source);
+        if let Some(profile) = router.route_profiles.get(&profile_name).cloned() {
+            profile.apply_to(&mut router);
         }
         router
     }
@@ -378,6 +425,73 @@ fn default_source_route_profiles() -> BTreeMap<String, String> {
         ("default-nanobot".to_string(), "gemini".to_string()),
         ("guangzhou-nanobot".to_string(), "default".to_string()),
     ])
+}
+
+fn default_route_rules() -> Vec<RouteRule> {
+    vec![
+        RouteRule {
+            name: "free-health-and-memory".to_string(),
+            priority: 10,
+            role: "emergency".to_string(),
+            model: "LongCat-Flash-Chat".to_string(),
+            group: "longcat".to_string(),
+            reason: "free task pattern matched".to_string(),
+            hint_patterns: vec![
+                "heartbeat".to_string(),
+                "healthcheck".to_string(),
+                "self_check".to_string(),
+                "self-check".to_string(),
+            ],
+            latest_text_patterns: vec![
+                "heartbeat.md".to_string(),
+                "heartbeat agent".to_string(),
+                "heartbeat tool".to_string(),
+                "\"name\":\"heartbeat\"".to_string(),
+                "\"name\": \"heartbeat\"".to_string(),
+            ],
+            task_text_patterns: vec![
+                "extract key facts from this conversation".to_string(),
+                "only output items matching these categories".to_string(),
+                "output as concise bullet points".to_string(),
+            ],
+            ..RouteRule::default()
+        },
+        RouteRule {
+            name: "complex-work-to-pro".to_string(),
+            priority: 80,
+            role: "pro".to_string(),
+            reason: "complex task pattern matched".to_string(),
+            hint_patterns: vec![
+                "compact".to_string(),
+                "compression".to_string(),
+                "summarize".to_string(),
+                "summary".to_string(),
+                "memory".to_string(),
+                "reflection".to_string(),
+                "review".to_string(),
+                "code_review".to_string(),
+                "architecture".to_string(),
+                "migration".to_string(),
+                "reasoning".to_string(),
+                "analysis".to_string(),
+                "diagnose".to_string(),
+                "root_cause".to_string(),
+            ],
+            any_text_patterns: vec![
+                "context compression".to_string(),
+                "memory consolidation".to_string(),
+                "code review".to_string(),
+                "review existing".to_string(),
+                "root cause".to_string(),
+                "上下文压缩".to_string(),
+                "压缩上下文".to_string(),
+                "代码审查".to_string(),
+                "根因".to_string(),
+                "排障".to_string(),
+            ],
+            ..RouteRule::default()
+        },
+    ]
 }
 
 pub fn load_config<P: AsRef<Path>>(path: P) -> Vec<Channel> {
