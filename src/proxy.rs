@@ -471,6 +471,7 @@ async fn handle_proxy(
         &route_hints,
         &source,
     );
+    let free_task_timeout = free_task_timeout(&decision);
     let attempts = build_attempts(&state, &channels, &effective_router, &decision, protocol).await;
     if attempts.is_empty() {
         record_failure(
@@ -545,7 +546,37 @@ async fn handle_proxy(
         }
         target_req = upstream_protocol.apply_channel_auth(target_req, &attempt.channel);
 
-        let response = match target_req.send().await {
+        let send_result = if let Some(timeout) = free_task_timeout {
+            match tokio::time::timeout(timeout, target_req.send()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    record_result(
+                        &state,
+                        &attempt.channel,
+                        &decision.requested_model,
+                        &attempt.actual_model,
+                        &attempt.role,
+                        &format!(
+                            "{}; free task upstream timeout after {}ms",
+                            attempt.reason,
+                            timeout.as_millis()
+                        ),
+                        StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        started.elapsed(),
+                        TokenUsage::default(),
+                        &source,
+                        &request_id,
+                        &attempt.stage,
+                    )
+                    .await;
+                    continue;
+                }
+            }
+        } else {
+            target_req.send().await
+        };
+
+        let response = match send_result {
             Ok(res) => res,
             Err(e) => {
                 record_result(
@@ -1343,7 +1374,12 @@ async fn build_attempts(
     protocol: ApiProtocol,
 ) -> Vec<Attempt> {
     let mut specs = Vec::new();
-    add_decision_attempts(&mut specs, decision);
+    let allow_fallbacks = !free_task_decision(decision);
+    add_decision_attempts(&mut specs, decision, allow_fallbacks);
+
+    if !allow_fallbacks {
+        return attempts_from_specs(state, channels, decision, protocol, specs).await;
+    }
 
     for &role in fallback_roles(&decision.role) {
         if role == "any" {
@@ -1364,6 +1400,16 @@ async fn build_attempts(
             );
         }
     }
+    attempts_from_specs(state, channels, decision, protocol, specs).await
+}
+
+async fn attempts_from_specs(
+    state: &Arc<ProxyState>,
+    channels: &[Channel],
+    decision: &RouteDecision,
+    protocol: ApiProtocol,
+    specs: Vec<AttemptSpec>,
+) -> Vec<Attempt> {
     let mut attempts = Vec::new();
     for spec in specs {
         let mut candidates: Vec<Channel> = channels
@@ -1442,6 +1488,22 @@ fn attempt_stage(spec: &AttemptSpec) -> String {
     }
 }
 
+fn free_task_decision(decision: &RouteDecision) -> bool {
+    decision.reason.contains("free task pattern matched")
+        || decision.reason.contains("free-health-and-memory")
+}
+
+fn free_task_timeout(decision: &RouteDecision) -> Option<Duration> {
+    if !free_task_decision(decision) {
+        return None;
+    }
+    let ms = env::var("OBP_FREE_TASK_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(8_000);
+    Some(Duration::from_millis(ms.max(500)))
+}
+
 fn fallback_roles(role: &str) -> &'static [&'static str] {
     match role {
         // When the monthly hard limit is reached, save the emergency pool for true incidents.
@@ -1463,7 +1525,11 @@ fn model_for_role<'a>(router: &'a RouterConfig, role: &str) -> &'a str {
     }
 }
 
-fn add_decision_attempts(specs: &mut Vec<AttemptSpec>, decision: &RouteDecision) {
+fn add_decision_attempts(
+    specs: &mut Vec<AttemptSpec>,
+    decision: &RouteDecision,
+    allow_fallbacks: bool,
+) {
     add_attempt_spec(
         specs,
         decision.role.clone(),
@@ -1471,7 +1537,7 @@ fn add_decision_attempts(specs: &mut Vec<AttemptSpec>, decision: &RouteDecision)
         decision.desired_model.clone(),
         false,
     );
-    if !decision.group.is_empty() {
+    if allow_fallbacks && !decision.group.is_empty() {
         add_attempt_spec(
             specs,
             decision.role.clone(),
@@ -2589,6 +2655,57 @@ mod tests {
         assert_eq!(attempts.first().unwrap().channel.name, "LongCat");
         assert_eq!(attempts.first().unwrap().group, "longcat");
         assert_eq!(attempts.first().unwrap().actual_model, "LongCat-Flash-Chat");
+    }
+
+    #[tokio::test]
+    async fn free_task_route_does_not_fallback_to_profile_emergency_group() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let decision = RouteDecision {
+            requested_model: "deepseek-v4-flash".to_string(),
+            desired_model: "LongCat-Flash-Chat".to_string(),
+            role: "emergency".to_string(),
+            group: "longcat".to_string(),
+            reason: "rule free-health-and-memory: free task pattern matched".to_string(),
+        };
+        let channels = vec![
+            Channel {
+                name: "LongCat".to_string(),
+                models: "LongCat-Flash-Chat".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"LongCat-Flash-Chat"}"#.to_string(),
+                role: "emergency".to_string(),
+                group: "longcat".to_string(),
+                priority: 10,
+                ..Channel::default()
+            },
+            Channel {
+                name: "Gemini".to_string(),
+                models: "deepseek-v4-flash,gemini-3.1-flash-lite".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"gemini-3.1-flash-lite"}"#.to_string(),
+                role: "emergency".to_string(),
+                group: "gemini".to_string(),
+                priority: 20,
+                ..Channel::default()
+            },
+        ];
+        let state = Arc::new(ProxyState {
+            client: reqwest::Client::new(),
+            channels: Mutex::new(vec![]),
+            router: Mutex::new(router.clone()),
+            stats: Mutex::new(UsageStats::default()),
+            index: Mutex::new(0),
+            config_path: String::new(),
+            router_path: String::new(),
+            stats_path: String::new(),
+            serial_channel_locks: Mutex::new(Default::default()),
+        });
+
+        let attempts =
+            build_attempts(&state, &channels, &router, &decision, ApiProtocol::OpenAI).await;
+
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].channel.name, "LongCat");
+        assert_eq!(attempts[0].stage, "primary");
     }
 
     #[test]
