@@ -1343,13 +1343,7 @@ async fn build_attempts(
     protocol: ApiProtocol,
 ) -> Vec<Attempt> {
     let mut specs = Vec::new();
-    add_role_attempts(
-        &mut specs,
-        router,
-        decision.role.clone(),
-        decision.desired_model.clone(),
-        false,
-    );
+    add_decision_attempts(&mut specs, decision);
 
     for &role in fallback_roles(&decision.role) {
         if role == "any" {
@@ -1466,6 +1460,25 @@ fn model_for_role<'a>(router: &'a RouterConfig, role: &str) -> &'a str {
         "backup" => router.backup_model.as_str(),
         "default" => router.default_model.as_str(),
         _ => router.default_model.as_str(),
+    }
+}
+
+fn add_decision_attempts(specs: &mut Vec<AttemptSpec>, decision: &RouteDecision) {
+    add_attempt_spec(
+        specs,
+        decision.role.clone(),
+        decision.group.clone(),
+        decision.desired_model.clone(),
+        false,
+    );
+    if !decision.group.is_empty() {
+        add_attempt_spec(
+            specs,
+            decision.role.clone(),
+            String::new(),
+            decision.desired_model.clone(),
+            true,
+        );
     }
 }
 
@@ -2525,6 +2538,57 @@ mod tests {
 
         assert_eq!(attempts.first().unwrap().channel.name, "Gemini");
         assert_eq!(attempts.first().unwrap().actual_model, "gemini-3.5-flash");
+    }
+
+    #[tokio::test]
+    async fn route_rule_group_is_preserved_before_profile_fallback_group() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let decision = RouteDecision {
+            requested_model: "deepseek-v4-flash".to_string(),
+            desired_model: "LongCat-Flash-Chat".to_string(),
+            role: "emergency".to_string(),
+            group: "longcat".to_string(),
+            reason: "rule free-health-and-memory".to_string(),
+        };
+        let channels = vec![
+            Channel {
+                name: "LongCat".to_string(),
+                models: "LongCat-Flash-Chat".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"LongCat-Flash-Chat"}"#.to_string(),
+                role: "emergency".to_string(),
+                group: "longcat".to_string(),
+                priority: 10,
+                ..Channel::default()
+            },
+            Channel {
+                name: "Gemini".to_string(),
+                models: "deepseek-v4-flash,gemini-3.1-flash-lite".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"gemini-3.1-flash-lite"}"#.to_string(),
+                role: "emergency".to_string(),
+                group: "gemini".to_string(),
+                priority: 20,
+                ..Channel::default()
+            },
+        ];
+        let state = Arc::new(ProxyState {
+            client: reqwest::Client::new(),
+            channels: Mutex::new(vec![]),
+            router: Mutex::new(router.clone()),
+            stats: Mutex::new(UsageStats::default()),
+            index: Mutex::new(0),
+            config_path: String::new(),
+            router_path: String::new(),
+            stats_path: String::new(),
+            serial_channel_locks: Mutex::new(Default::default()),
+        });
+
+        let attempts =
+            build_attempts(&state, &channels, &router, &decision, ApiProtocol::OpenAI).await;
+
+        assert_eq!(attempts.first().unwrap().channel.name, "LongCat");
+        assert_eq!(attempts.first().unwrap().group, "longcat");
+        assert_eq!(attempts.first().unwrap().actual_model, "LongCat-Flash-Chat");
     }
 
     #[test]
