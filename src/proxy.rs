@@ -471,6 +471,7 @@ async fn handle_proxy(
         &route_hints,
         &source,
     );
+    let decision = apply_gemini_health_route(&effective_router, &stats, decision);
     let free_task_timeout = free_task_timeout(&decision);
     let attempts = build_attempts(&state, &channels, &effective_router, &decision, protocol).await;
     if attempts.is_empty() {
@@ -624,7 +625,12 @@ async fn handle_proxy(
             }
             let headers = response.headers().clone();
             let mut upstream_stream = response.bytes_stream();
-            let probe = probe_stream_until_output(&mut upstream_stream, started).await;
+            let probe = probe_stream_until_output(
+                &mut upstream_stream,
+                started,
+                first_text_timeout_for_attempt(&attempt),
+            )
+            .await;
             if let Some(error) = probe.error {
                 record_result_with_first_chunk(
                     &state,
@@ -850,12 +856,15 @@ struct StreamProbe {
     error: Option<String>,
 }
 
-async fn probe_stream_until_output<S>(upstream: &mut S, started: Instant) -> StreamProbe
+async fn probe_stream_until_output<S>(
+    upstream: &mut S,
+    started: Instant,
+    timeout: Duration,
+) -> StreamProbe
 where
     S: futures_util::Stream<Item = Result<Bytes, reqwest::Error>> + Unpin,
 {
     let mut probe = StreamProbe::default();
-    let timeout = first_text_timeout();
     let probe_started = Instant::now();
     let mut sse_buffer = String::new();
 
@@ -895,12 +904,30 @@ where
     probe
 }
 
+fn first_text_timeout_for_attempt(attempt: &Attempt) -> Duration {
+    if is_gemini_attempt(attempt) {
+        let ms = env::var("OBP_GEMINI_FIRST_TEXT_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(4_500);
+        return Duration::from_millis(ms.max(1));
+    }
+    first_text_timeout()
+}
+
 fn first_text_timeout() -> Duration {
     let ms = env::var("OBP_FIRST_TEXT_TIMEOUT_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
         .unwrap_or(9_000);
     Duration::from_millis(ms.max(1))
+}
+
+fn is_gemini_attempt(attempt: &Attempt) -> bool {
+    attempt.group.eq_ignore_ascii_case("gemini")
+        || attempt.channel.group_key() == "gemini"
+        || attempt.channel.cost_model.to_lowercase().contains("gemini")
+        || attempt.actual_model.to_lowercase().contains("gemini")
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
@@ -955,6 +982,101 @@ fn choice_has_output(choice: &Value) -> bool {
             .and_then(Value::as_str)
             .map(|text| !text.is_empty())
             .unwrap_or(false)
+}
+
+fn apply_gemini_health_route(
+    router: &RouterConfig,
+    stats: &UsageStats,
+    decision: RouteDecision,
+) -> RouteDecision {
+    if !gemini_health_routing_enabled()
+        || !decision.group.eq_ignore_ascii_case("gemini")
+        || decision.role != "default"
+        || !decision.desired_model.to_lowercase().contains("gemini")
+    {
+        return decision;
+    }
+
+    let fallback_model = router.backup_model.trim();
+    let fallback_group = group_for_role(router, "backup");
+    if fallback_model.is_empty()
+        || fallback_group != "gemini"
+        || model_eq(fallback_model, &decision.desired_model)
+    {
+        return decision;
+    }
+
+    let Some(summary) = gemini_health_slow_reason(stats, &decision.desired_model) else {
+        return decision;
+    };
+
+    RouteDecision {
+        requested_model: decision.requested_model,
+        desired_model: fallback_model.to_string(),
+        role: "backup".to_string(),
+        group: fallback_group,
+        reason: format!(
+            "{}; gemini rolling health switched to {} ({})",
+            decision.reason, fallback_model, summary
+        ),
+    }
+}
+
+fn gemini_health_routing_enabled() -> bool {
+    env::var("OBP_GEMINI_HEALTH_ROUTING")
+        .map(|value| !matches!(value.trim().to_lowercase().as_str(), "0" | "false" | "off"))
+        .unwrap_or(true)
+}
+
+fn gemini_health_slow_reason(stats: &UsageStats, model: &str) -> Option<String> {
+    let window = env_u64("OBP_GEMINI_HEALTH_WINDOW", 30) as usize;
+    let min_samples = env_u64("OBP_GEMINI_HEALTH_MIN_SAMPLES", 12) as usize;
+    let p95_threshold = env_u64("OBP_GEMINI_HEALTH_P95_MS", 8_000);
+    let max_threshold = env_u64("OBP_GEMINI_HEALTH_MAX_MS", 15_000);
+    let mut samples: Vec<u64> = stats
+        .recent
+        .iter()
+        .rev()
+        .filter(|log| (200..400).contains(&log.status))
+        .filter(|log| log.route_profile.eq_ignore_ascii_case("gemini"))
+        .filter(|log| model_eq(&log.model, model))
+        .filter_map(|log| log.first_text_ms)
+        .take(window.max(1))
+        .collect();
+
+    if samples.len() < min_samples.max(1) {
+        return None;
+    }
+    samples.sort_unstable();
+    let p95 = percentile_nearest_rank(&samples, 95);
+    let max = *samples.last().unwrap_or(&0);
+    if p95 >= p95_threshold || max >= max_threshold {
+        Some(format!(
+            "model={} samples={} p95={}ms max={}ms",
+            model,
+            samples.len(),
+            p95,
+            max
+        ))
+    } else {
+        None
+    }
+}
+
+fn percentile_nearest_rank(sorted: &[u64], percentile: u64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank =
+        ((sorted.len() as u64 * percentile).saturating_add(99) / 100).saturating_sub(1) as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 fn route_decision(
@@ -1381,7 +1503,7 @@ async fn build_attempts(
         return attempts_from_specs(state, channels, decision, protocol, specs).await;
     }
 
-    for &role in fallback_roles(&decision.role) {
+    for &role in fallback_roles(decision) {
         if role == "any" {
             add_attempt_spec(
                 &mut specs,
@@ -1504,11 +1626,20 @@ fn free_task_timeout(decision: &RouteDecision) -> Option<Duration> {
     Some(Duration::from_millis(ms.max(500)))
 }
 
-fn fallback_roles(role: &str) -> &'static [&'static str] {
-    match role {
+fn fallback_roles(decision: &RouteDecision) -> &'static [&'static str] {
+    if decision.group.eq_ignore_ascii_case("gemini") {
+        return match decision.role.as_str() {
+            // Gemini profile must stay inside the free Gemini pool; do not leak to paid DeepSeek.
+            "default" | "pro" => &["emergency", "backup"],
+            "emergency" => &["backup"],
+            "backup" => &["emergency"],
+            _ => &[],
+        };
+    }
+    match decision.role.as_str() {
         // When the monthly hard limit is reached, save the emergency pool for true incidents.
         "backup" => &["emergency", "any"],
-        // Normal traffic should fail over to emergency first because this means the main pool timed out or errored.
+        // Normal non-Gemini traffic keeps the historical fallback order.
         "default" | "pro" => &["emergency", "backup", "any"],
         "emergency" => &["backup", "any"],
         _ => &["any"],
@@ -1537,7 +1668,10 @@ fn add_decision_attempts(
         decision.desired_model.clone(),
         false,
     );
-    if allow_fallbacks && !decision.group.is_empty() {
+    if allow_fallbacks
+        && !decision.group.is_empty()
+        && !decision.group.eq_ignore_ascii_case("gemini")
+    {
         add_attempt_spec(
             specs,
             decision.role.clone(),
@@ -2532,7 +2666,7 @@ mod tests {
             "default-nanobot",
         );
 
-        assert_eq!(decision.desired_model, "gemini-flash");
+        assert_eq!(decision.desired_model, "gemini-3.5-flash");
         assert_eq!(decision.group, "gemini");
     }
 
@@ -2755,5 +2889,96 @@ mod tests {
         assert_eq!(decision.role, "emergency");
         assert_eq!(decision.group, "longcat");
         assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
+    }
+
+    #[test]
+    fn gemini_health_routes_slow_default_to_lite() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let mut stats = UsageStats::default();
+        for idx in 0..12 {
+            stats.record(RequestLog::new(
+                format!("req-{idx}"),
+                "default-nanobot".to_string(),
+                Some(1),
+                "Gemini".to_string(),
+                "deepseek-v4-flash".to_string(),
+                "gemini-3.5-flash".to_string(),
+                "default".to_string(),
+                "default lightweight route".to_string(),
+                "gemini".to_string(),
+                "primary".to_string(),
+                200,
+                9_500,
+                TokenUsage::default(),
+                Some(700),
+                Some(9_000),
+            ));
+        }
+        let decision = RouteDecision {
+            requested_model: "deepseek-v4-flash".to_string(),
+            desired_model: "gemini-3.5-flash".to_string(),
+            role: "default".to_string(),
+            group: "gemini".to_string(),
+            reason: "default lightweight route".to_string(),
+        };
+
+        let routed = apply_gemini_health_route(&router, &stats, decision);
+
+        assert_eq!(routed.role, "backup");
+        assert_eq!(routed.group, "gemini");
+        assert_eq!(routed.desired_model, "gemini-3.1-flash-lite");
+        assert!(routed.reason.contains("rolling health"));
+    }
+
+    #[tokio::test]
+    async fn gemini_fallbacks_do_not_leak_to_deepseek() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let decision = RouteDecision {
+            requested_model: "deepseek-v4-flash".to_string(),
+            desired_model: "gemini-3.5-flash".to_string(),
+            role: "default".to_string(),
+            group: "gemini".to_string(),
+            reason: "default lightweight route".to_string(),
+        };
+        let channels = vec![
+            Channel {
+                name: "Gemini".to_string(),
+                models: "gemini-3.5-flash,gemini-3.1-flash-lite".to_string(),
+                role: "default".to_string(),
+                group: "gemini".to_string(),
+                priority: 10,
+                ..Channel::default()
+            },
+            Channel {
+                name: "DeepSeek".to_string(),
+                models: "deepseek-v4-flash".to_string(),
+                role: "default".to_string(),
+                group: "deepseek".to_string(),
+                priority: 1,
+                ..Channel::default()
+            },
+        ];
+        let state = Arc::new(ProxyState {
+            client: reqwest::Client::new(),
+            channels: Mutex::new(vec![]),
+            router: Mutex::new(router.clone()),
+            stats: Mutex::new(UsageStats::default()),
+            index: Mutex::new(0),
+            config_path: String::new(),
+            router_path: String::new(),
+            stats_path: String::new(),
+            serial_channel_locks: Mutex::new(Default::default()),
+        });
+
+        let attempts =
+            build_attempts(&state, &channels, &router, &decision, ApiProtocol::OpenAI).await;
+
+        assert!(!attempts.is_empty());
+        assert!(attempts.iter().all(|attempt| attempt.group == "gemini"));
+        assert!(attempts
+            .iter()
+            .all(|attempt| attempt.channel.group_key() == "gemini"));
     }
 }

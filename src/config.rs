@@ -199,13 +199,13 @@ impl RouteProfile {
 
     pub fn gemini_stack() -> Self {
         Self {
-            default_model: "gemini-flash".to_string(),
-            pro_model: "gemini-pro".to_string(),
-            emergency_model: "LongCat-Flash-Chat".to_string(),
-            backup_model: "gemini-flash".to_string(),
+            default_model: "gemini-3.5-flash".to_string(),
+            pro_model: "gemini-3.1-pro".to_string(),
+            emergency_model: "gemini-3.1-flash-lite".to_string(),
+            backup_model: "gemini-3.1-flash-lite".to_string(),
             default_group: "gemini".to_string(),
             pro_group: "gemini".to_string(),
-            emergency_group: "longcat".to_string(),
+            emergency_group: "gemini".to_string(),
             backup_group: "gemini".to_string(),
         }
     }
