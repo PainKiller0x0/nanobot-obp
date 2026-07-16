@@ -254,6 +254,8 @@ pub struct UsageBreakdown {
     #[serde(default)]
     pub by_model: BTreeMap<String, UsageBucket>,
     #[serde(default)]
+    pub by_model_month: BTreeMap<String, BTreeMap<String, UsageBucket>>,
+    #[serde(default)]
     pub by_route: BTreeMap<String, UsageBucket>,
 }
 
@@ -283,8 +285,12 @@ impl UsageBreakdown {
             .entry(log.month.clone())
             .or_default()
             .add(log);
-        self.by_model
-            .entry(normalize_key(log.model.clone(), "unknown-model"))
+        let model_key = normalize_key(log.model.clone(), "unknown-model");
+        self.by_model.entry(model_key.clone()).or_default().add(log);
+        self.by_model_month
+            .entry(model_key)
+            .or_default()
+            .entry(log.month.clone())
             .or_default()
             .add(log);
         self.by_route
@@ -344,6 +350,8 @@ pub struct UsageStats {
     #[serde(default)]
     pub by_model: BTreeMap<String, UsageBucket>,
     #[serde(default)]
+    pub by_model_month: BTreeMap<String, BTreeMap<String, UsageBucket>>,
+    #[serde(default)]
     pub by_route: BTreeMap<String, UsageBucket>,
     #[serde(default)]
     pub recent: Vec<RequestLog>,
@@ -398,8 +406,15 @@ impl UsageStats {
             .entry(log.month.clone())
             .or_default()
             .add(&log);
+        let model_key = normalize_key(log.model.clone(), "unknown-model");
         self.by_model
-            .entry(normalize_key(log.model.clone(), "unknown-model"))
+            .entry(model_key.clone())
+            .or_default()
+            .add(&log);
+        self.by_model_month
+            .entry(model_key)
+            .or_default()
+            .entry(log.month.clone())
             .or_default()
             .add(&log);
         self.by_route
@@ -467,6 +482,60 @@ impl UsageStats {
         }
     }
 
+    pub fn rebuild_model_month_from_recent_if_empty(&mut self) {
+        if self.by_month.len() == 1 && !self.by_model.is_empty() {
+            let month = self.by_month.keys().next().cloned().unwrap_or_default();
+            let mut filled = false;
+            for (model, bucket) in &self.by_model {
+                let months = self.by_model_month.entry(model.clone()).or_default();
+                if !months.contains_key(&month) {
+                    months.insert(month.clone(), bucket.clone());
+                    filled = true;
+                }
+            }
+            if filled {
+                return;
+            }
+        }
+        if !self.by_model_month.is_empty() {
+            return;
+        }
+        for log in &self.recent {
+            let model_key = normalize_key(log.model.clone(), "unknown-model");
+            self.by_model_month
+                .entry(model_key)
+                .or_default()
+                .entry(log.month.clone())
+                .or_default()
+                .add(log);
+        }
+    }
+
+    pub fn deepseek_total_usage(&self) -> UsageBucket {
+        let mut bucket = UsageBucket::default();
+        for (model, item) in &self.by_model {
+            if is_deepseek_usage_model(model) {
+                bucket.add_bucket(item);
+            }
+        }
+        bucket
+    }
+
+    pub fn deepseek_current_month_usage(&self) -> UsageBucket {
+        let (day, _) = shanghai_strings(now_unix_secs());
+        let month = day.get(0..7).unwrap_or("");
+        let mut bucket = UsageBucket::default();
+        for (model, months) in &self.by_model_month {
+            if !is_deepseek_usage_model(model) {
+                continue;
+            }
+            if let Some(item) = months.get(month) {
+                bucket.add_bucket(item);
+            }
+        }
+        bucket
+    }
+
     pub fn current_month_cost(&self) -> f64 {
         let (day, _) = shanghai_strings(now_unix_secs());
         let month = day.get(0..7).unwrap_or("");
@@ -475,6 +544,11 @@ impl UsageStats {
             .map(|bucket| bucket.cost_cny)
             .unwrap_or(0.0)
     }
+}
+
+fn is_deepseek_usage_model(model: &str) -> bool {
+    let key = model.to_lowercase();
+    key.contains("deepseek") || key.contains("v4-flash") || key.contains("v4-pro")
 }
 
 fn is_paid_usage(model: &str, cost_cny: f64) -> bool {
@@ -561,6 +635,7 @@ pub fn load_stats<P: AsRef<Path>>(path: P) -> UsageStats {
     let mut stats: UsageStats = serde_json::from_str(&data).unwrap_or_default();
     stats.backfill_default_source("default-nanobot");
     stats.rebuild_billing_if_empty();
+    stats.rebuild_model_month_from_recent_if_empty();
     stats
 }
 
@@ -772,7 +847,7 @@ mod tests {
             None,
             "LongCat".to_string(),
             "deepseek-v4-flash".to_string(),
-            "LongCat-Flash-Chat".to_string(),
+            "LongCat-2.0-Preview".to_string(),
             "emergency".to_string(),
             "test".to_string(),
             "default".to_string(),
@@ -811,7 +886,7 @@ mod tests {
             .insert("deepseek-v4-flash".to_string(), paid.clone());
         stats
             .by_model
-            .insert("LongCat-Flash-Chat".to_string(), free.clone());
+            .insert("LongCat-2.0-Preview".to_string(), free.clone());
         let mut month = UsageBucket::default();
         month.add_bucket(&paid);
         month.add_bucket(&free);
@@ -849,7 +924,7 @@ mod tests {
             .insert("deepseek-v4-flash".to_string(), paid.clone());
         stats
             .by_model
-            .insert("LongCat-Flash-Chat".to_string(), free);
+            .insert("LongCat-2.0-Preview".to_string(), free);
         stats.paid.total.requests = 1;
 
         stats.rebuild_billing_if_empty();
@@ -875,7 +950,7 @@ mod tests {
             .insert("deepseek-v4-flash".to_string(), paid.clone());
         stats
             .by_model
-            .insert("LongCat-Flash-Chat".to_string(), free.clone());
+            .insert("LongCat-2.0-Preview".to_string(), free.clone());
         let mut total = UsageBucket::default();
         total.add_bucket(&paid);
         total.add_bucket(&free);
@@ -915,7 +990,7 @@ mod tests {
             .insert("deepseek-v4-flash".to_string(), paid.clone());
         stats
             .by_model
-            .insert("LongCat-Flash-Chat".to_string(), free.clone());
+            .insert("LongCat-2.0-Preview".to_string(), free.clone());
         let mut total = UsageBucket::default();
         total.add_bucket(&paid);
         total.add_bucket(&free);

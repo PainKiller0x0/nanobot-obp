@@ -26,6 +26,7 @@ pub struct ProxyState {
     pub config_path: String,
     pub router_path: String,
     pub stats_path: String,
+    pub deepseek_balance_path: String,
     pub serial_channel_locks: Mutex<HashMap<String, Arc<Semaphore>>>,
 }
 
@@ -396,6 +397,130 @@ const PRO_TEXT_PATTERNS: &[&str] = &[
     "根因",
     "排障",
 ];
+fn request_wants_image_generation(request_json: Option<&Value>) -> bool {
+    let Some(value) = request_json else {
+        return false;
+    };
+    let latest = latest_user_text(value);
+    explicit_image_generation_prompt(&latest)
+}
+
+fn header_truthy(headers: &HeaderMap, name: &str) -> bool {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn latest_user_text(value: &Value) -> String {
+    value
+        .get("messages")
+        .and_then(Value::as_array)
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message
+                        .get("role")
+                        .and_then(Value::as_str)
+                        .map(|role| role.eq_ignore_ascii_case("user"))
+                        .unwrap_or(false)
+                })
+                .map(message_text)
+        })
+        .unwrap_or_default()
+}
+
+fn message_text(message: &Value) -> String {
+    content_text(message.get("content").unwrap_or(&Value::Null))
+}
+
+fn content_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.get("input_text").and_then(Value::as_str))
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+fn explicit_image_generation_prompt(prompt: &str) -> bool {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    let negative = [
+        "don't generate",
+        "do not generate",
+        "no image",
+        "not image",
+        "\u{4e0d}\u{8981}\u{753b}",
+        "\u{4e0d}\u{7528}\u{753b}",
+        "\u{522b}\u{753b}",
+        "\u{4e0d}\u{8981}\u{751f}\u{6210}",
+        "\u{4e0d}\u{7528}\u{751f}\u{6210}",
+        "\u{522b}\u{751f}\u{6210}",
+    ];
+    if negative.iter().any(|needle| lower.contains(needle)) {
+        return false;
+    }
+    let english = [
+        "generate an image",
+        "generate image",
+        "create an image",
+        "create image",
+        "draw an image",
+        "draw image",
+        "draw me a",
+        "make an image",
+        "make image",
+    ];
+    if english.iter().any(|needle| lower.contains(needle)) {
+        return true;
+    }
+    let chinese = [
+        "\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}",
+        "\u{5e2e}\u{6211}\u{753b}\u{4e00}\u{5f20}",
+        "\u{8bf7}\u{753b}\u{4e00}\u{5f20}",
+        "\u{753b}\u{4e00}\u{5f20}",
+        "\u{7ed9}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}",
+        "\u{5e2e}\u{6211}\u{751f}\u{6210}\u{4e00}\u{5f20}",
+        "\u{751f}\u{6210}\u{4e00}\u{5f20}\u{56fe}",
+        "\u{751f}\u{6210}\u{4e00}\u{5f20}\u{56fe}\u{7247}",
+        "\u{751f}\u{6210}\u{56fe}\u{7247}",
+        "\u{751f}\u{6210}\u{56fe}\u{50cf}",
+        "\u{5e2e}\u{6211}\u{751f}\u{56fe}",
+        "\u{7ed9}\u{6211}\u{751f}\u{56fe}",
+        "\u{8bf7}\u{751f}\u{56fe}",
+        "\u{751f}\u{4e00}\u{5f20}\u{56fe}",
+        "\u{505a}\u{4e00}\u{5f20}\u{56fe}",
+        "\u{5236}\u{4f5c}\u{4e00}\u{5f20}\u{56fe}",
+    ];
+    chinese.iter().any(|needle| trimmed.contains(needle))
+}
+
+fn image_generation_upstream_timeout() -> Duration {
+    let ms = env::var("OBP_IMAGE_GENERATION_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(180_000);
+    Duration::from_millis(ms.max(30_000))
+}
 
 pub async fn handle_openai_proxy(
     State(state): State<Arc<ProxyState>>,
@@ -444,6 +569,8 @@ async fn handle_proxy(
     let route_hints = RouteHints::from_request(&parts.headers, request_json.as_ref());
     let source = request_source(&parts.headers, request_json.as_ref());
     let request_id = request_id(&parts.headers, request_json.as_ref());
+    let image_generation_request = request_wants_image_generation(request_json.as_ref())
+        || header_truthy(&parts.headers, "x-obp-image-generation");
 
     let router = state.router.lock().await.clone().normalized();
     let route_profile = router.profile_name_for_source(&source);
@@ -471,9 +598,22 @@ async fn handle_proxy(
         &route_hints,
         &source,
     );
-    let decision = apply_gemini_health_route(&effective_router, &stats, decision);
+    let decision = if image_generation_request {
+        decision
+    } else {
+        apply_gemini_health_route(&effective_router, &stats, decision)
+    };
     let free_task_timeout = free_task_timeout(&decision);
-    let attempts = build_attempts(&state, &channels, &effective_router, &decision, protocol).await;
+    let pro_timeout = pro_response_timeout(&decision, &effective_router);
+    let attempts = build_attempts(
+        &state,
+        &channels,
+        &effective_router,
+        &decision,
+        protocol,
+        image_generation_request,
+    )
+    .await;
     if attempts.is_empty() {
         record_failure(
             &state,
@@ -546,6 +686,9 @@ async fn handle_proxy(
             }
         }
         target_req = upstream_protocol.apply_channel_auth(target_req, &attempt.channel);
+        if image_generation_request {
+            target_req = target_req.timeout(image_generation_upstream_timeout());
+        }
 
         let send_result = if let Some(timeout) = free_task_timeout {
             match tokio::time::timeout(timeout, target_req.send()).await {
@@ -573,8 +716,70 @@ async fn handle_proxy(
                     continue;
                 }
             }
+        } else if let Some(timeout) = pro_timeout {
+            if attempt.role == "pro" {
+                match tokio::time::timeout(timeout, target_req.send()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        record_result(
+                            &state,
+                            &attempt.channel,
+                            &decision.requested_model,
+                            &attempt.actual_model,
+                            &attempt.role,
+                            &format!(
+                                "{}; pro response timeout after {}ms",
+                                attempt.reason,
+                                timeout.as_millis()
+                            ),
+                            StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                            started.elapsed(),
+                            TokenUsage::default(),
+                            &source,
+                            &request_id,
+                            &attempt.stage,
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            } else {
+                target_req.send().await
+            }
         } else {
-            target_req.send().await
+            let default_timeout = Duration::from_millis(
+                std::env::var("OBP_DEFAULT_TIMEOUT_MS")
+                    .ok()
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(30_000)
+                    .max(5_000)
+                    .min(120_000),
+            );
+            match tokio::time::timeout(default_timeout, target_req.send()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    record_result(
+                        &state,
+                        &attempt.channel,
+                        &decision.requested_model,
+                        &attempt.actual_model,
+                        &attempt.role,
+                        &format!(
+                            "{}; upstream timeout after {}ms",
+                            attempt.reason,
+                            default_timeout.as_millis()
+                        ),
+                        StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                        started.elapsed(),
+                        TokenUsage::default(),
+                        &source,
+                        &request_id,
+                        &attempt.stage,
+                    )
+                    .await;
+                    continue;
+                }
+            }
         };
 
         let response = match send_result {
@@ -602,10 +807,11 @@ async fn handle_proxy(
         let status = StatusCode::from_u16(response.status().as_u16())
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         let status_u16 = status.as_u16();
-        let retryable = retry_statuses.contains(&status_u16);
+        let retryable = retry_statuses.contains(&status_u16)
+            || (!status.is_success() && !image_generation_request);
 
         if stream {
-            if retryable && attempt_idx + 1 < attempts.len() {
+            if retryable && !image_generation_request && attempt_idx + 1 < attempts.len() {
                 record_result(
                     &state,
                     &attempt.channel,
@@ -651,7 +857,7 @@ async fn handle_proxy(
                 .await;
                 continue;
             }
-            if probe.timed_out && attempt_idx + 1 < attempts.len() {
+            if probe.timed_out && !image_generation_request && attempt_idx + 1 < attempts.len() {
                 record_result_with_first_chunk(
                     &state,
                     &attempt.channel,
@@ -663,6 +869,33 @@ async fn handle_proxy(
                         attempt.reason
                     ),
                     StatusCode::GATEWAY_TIMEOUT.as_u16(),
+                    started.elapsed(),
+                    TokenUsage::default(),
+                    &source,
+                    &request_id,
+                    &attempt.stage,
+                    probe.first_chunk_ms,
+                    probe.first_text_ms,
+                )
+                .await;
+                continue;
+            }
+            if !image_generation_request
+                && is_gemini_attempt(&attempt)
+                && gemini_stale_failure_text(&probe.text_sample)
+                && attempt_idx + 1 < attempts.len()
+            {
+                record_result_with_first_chunk(
+                    &state,
+                    &attempt.channel,
+                    &decision.requested_model,
+                    &attempt.actual_model,
+                    &attempt.role,
+                    &format!(
+                        "{}; stale Gemini failure leaked into normal chat",
+                        attempt.reason
+                    ),
+                    StatusCode::BAD_GATEWAY.as_u16(),
                     started.elapsed(),
                     TokenUsage::default(),
                     &source,
@@ -741,6 +974,32 @@ async fn handle_proxy(
         };
         let response_bytes =
             rewrite_response_for_client(&response_bytes, status, protocol, upstream_protocol);
+        if status.is_success()
+            && !image_generation_request
+            && is_gemini_attempt(&attempt)
+            && gemini_stale_failure_text(&String::from_utf8_lossy(&response_bytes))
+            && attempt_idx + 1 < attempts.len()
+        {
+            record_result(
+                &state,
+                &attempt.channel,
+                &decision.requested_model,
+                &attempt.actual_model,
+                &attempt.role,
+                &format!(
+                    "{}; stale Gemini failure leaked into normal chat",
+                    attempt.reason
+                ),
+                StatusCode::BAD_GATEWAY.as_u16(),
+                started.elapsed(),
+                TokenUsage::default(),
+                &source,
+                &request_id,
+                &attempt.stage,
+            )
+            .await;
+            continue;
+        }
         let usage = TokenUsage::from_response_bytes(&response_bytes);
         record_result(
             &state,
@@ -781,7 +1040,7 @@ async fn handle_proxy(
                 (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response()
             });
 
-        if retryable && attempt_idx + 1 < attempts.len() {
+        if retryable && !image_generation_request && attempt_idx + 1 < attempts.len() {
             last_error = Some(response);
             continue;
         }
@@ -852,6 +1111,7 @@ struct StreamProbe {
     buffered: Vec<Bytes>,
     first_chunk_ms: Option<u64>,
     first_text_ms: Option<u64>,
+    text_sample: String,
     timed_out: bool,
     error: Option<String>,
 }
@@ -885,8 +1145,12 @@ where
                 if probe.first_chunk_ms.is_none() {
                     probe.first_chunk_ms = Some(elapsed_ms(started));
                 }
-                if sse_chunk_has_output(&mut sse_buffer, &chunk) {
-                    probe.first_text_ms = Some(elapsed_ms(started));
+                let output_text = sse_chunk_output_text(&mut sse_buffer, &chunk);
+                if !output_text.is_empty() {
+                    if probe.first_text_ms.is_none() {
+                        probe.first_text_ms = Some(elapsed_ms(started));
+                    }
+                    probe.text_sample.push_str(&output_text);
                 }
                 probe.buffered.push(chunk);
             }
@@ -934,54 +1198,71 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
 }
 
-fn sse_chunk_has_output(buffer: &mut String, chunk: &[u8]) -> bool {
+fn sse_chunk_output_text(buffer: &mut String, chunk: &[u8]) -> String {
     buffer.push_str(&String::from_utf8_lossy(chunk));
-    let mut saw_output = false;
+    let mut output = String::new();
     while let Some(pos) = buffer.find('\n') {
         let line = buffer[..pos].trim().to_string();
         buffer.drain(..=pos);
         let Some(data) = line.strip_prefix("data:") else {
             continue;
         };
-        if sse_data_has_output(data.trim()) {
-            saw_output = true;
-        }
+        output.push_str(&sse_data_output_text(data.trim()));
     }
-    saw_output
+    output
 }
 
-fn sse_data_has_output(data: &str) -> bool {
+fn sse_data_output_text(data: &str) -> String {
     if data.is_empty() || data == "[DONE]" {
-        return false;
+        return String::new();
     }
     let Ok(value) = serde_json::from_str::<Value>(data) else {
-        return data.contains("\"content\"") || data.contains("\"tool_calls\"");
+        if data.contains("\"content\"") || data.contains("\"tool_calls\"") {
+            return data.to_string();
+        }
+        return String::new();
     };
     value
         .get("choices")
         .and_then(Value::as_array)
-        .map(|choices| choices.iter().any(choice_has_output))
-        .unwrap_or(false)
+        .map(|choices| choices.iter().map(choice_output_text).collect::<String>())
+        .unwrap_or_default()
 }
 
-fn choice_has_output(choice: &Value) -> bool {
+fn choice_output_text(choice: &Value) -> String {
     let delta = choice.get("delta").unwrap_or(&Value::Null);
-    delta
-        .get("content")
-        .and_then(Value::as_str)
-        .map(|text| !text.is_empty())
+    let mut output = String::new();
+    if let Some(text) = delta.get("content").and_then(Value::as_str) {
+        output.push_str(text);
+    }
+    if delta
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
         .unwrap_or(false)
-        || delta
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .map(|items| !items.is_empty())
-            .unwrap_or(false)
-        || choice
-            .get("message")
-            .and_then(|message| message.get("content"))
-            .and_then(Value::as_str)
-            .map(|text| !text.is_empty())
-            .unwrap_or(false)
+    {
+        output.push_str("[tool_calls]");
+    }
+    if let Some(text) = choice
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+    {
+        output.push_str(text);
+    }
+    output
+}
+
+fn gemini_stale_failure_text(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    let api_error =
+        lower.contains("gemini request failed:") || lower.contains("gemini api error code:");
+    let chinese_hit = text.contains("\u{53ef}\u{4ee5}\u{641c}\u{7d22}\u{56fe}\u{7247}")
+        && (text.contains("\u{65e0}\u{6cd5}\u{4e3a}\u{60a8}\u{521b}\u{5efa}")
+            || text.contains("\u{5f00}\u{901a}\u{56fe}\u{7247}\u{521b}\u{5efa}"));
+    let english_hit = lower.contains("can search for images")
+        && (lower.contains("can't create") || lower.contains("cannot create"));
+    api_error || chinese_hit || english_hit
 }
 
 fn apply_gemini_health_route(
@@ -997,8 +1278,8 @@ fn apply_gemini_health_route(
         return decision;
     }
 
-    let fallback_model = router.backup_model.trim();
-    let fallback_group = group_for_role(router, "backup");
+    let fallback_model = router.emergency_model.trim();
+    let fallback_group = group_for_role(router, "emergency");
     if fallback_model.is_empty()
         || fallback_group != "gemini"
         || model_eq(fallback_model, &decision.desired_model)
@@ -1013,7 +1294,7 @@ fn apply_gemini_health_route(
     RouteDecision {
         requested_model: decision.requested_model,
         desired_model: fallback_model.to_string(),
-        role: "backup".to_string(),
+        role: "emergency".to_string(),
         group: fallback_group,
         reason: format!(
             "{}; gemini rolling health switched to {} ({})",
@@ -1494,9 +1775,10 @@ async fn build_attempts(
     router: &RouterConfig,
     decision: &RouteDecision,
     protocol: ApiProtocol,
+    image_generation_request: bool,
 ) -> Vec<Attempt> {
     let mut specs = Vec::new();
-    let allow_fallbacks = !free_task_decision(decision);
+    let allow_fallbacks = !free_task_decision(decision) && !image_generation_request;
     add_decision_attempts(&mut specs, decision, allow_fallbacks);
 
     if !allow_fallbacks {
@@ -1622,14 +1904,30 @@ fn free_task_timeout(decision: &RouteDecision) -> Option<Duration> {
     let ms = env::var("OBP_FREE_TASK_TIMEOUT_MS")
         .ok()
         .and_then(|raw| raw.trim().parse::<u64>().ok())
-        .unwrap_or(8_000);
+        .unwrap_or(15_000);
     Some(Duration::from_millis(ms.max(500)))
+}
+
+fn pro_response_timeout(decision: &RouteDecision, router: &RouterConfig) -> Option<Duration> {
+    if decision.role != "pro" {
+        return None;
+    }
+    // Timeout for pro requests: if pro takes too long, let it fail and fallback
+    let ms = std::env::var("OBP_PRO_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(router.pro_timeout_ms);
+    if ms > 0 {
+        Some(Duration::from_millis(ms))
+    } else {
+        None
+    }
 }
 
 fn fallback_roles(decision: &RouteDecision) -> &'static [&'static str] {
     if decision.group.eq_ignore_ascii_case("gemini") {
         return match decision.role.as_str() {
-            // Gemini profile must stay inside the free Gemini pool; do not leak to paid DeepSeek.
+            // Gemini profile first degrades inside Gemini, then uses the configured backup group.
             "default" | "pro" => &["emergency", "backup"],
             "emergency" => &["backup"],
             "backup" => &["emergency"],
@@ -2535,9 +2833,9 @@ mod tests {
             "default-nanobot",
         );
 
-        assert_eq!(decision.role, "emergency");
-        assert_eq!(decision.group, "longcat");
-        assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
+        assert_eq!(decision.role, "default");
+        assert_eq!(decision.group, "gemini");
+        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
         assert!(decision.reason.contains("free task"));
     }
 
@@ -2608,9 +2906,9 @@ mod tests {
             "default-nanobot",
         );
 
-        assert_eq!(decision.role, "emergency");
-        assert_eq!(decision.group, "longcat");
-        assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
+        assert_eq!(decision.role, "default");
+        assert_eq!(decision.group, "gemini");
+        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
     }
 
     #[test]
@@ -2636,9 +2934,9 @@ mod tests {
             "default-nanobot",
         );
 
-        assert_eq!(decision.role, "emergency");
-        assert_eq!(decision.group, "longcat");
-        assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
+        assert_eq!(decision.role, "default");
+        assert_eq!(decision.group, "gemini");
+        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
         assert!(decision.reason.contains("extract key facts"));
     }
 
@@ -2731,10 +3029,18 @@ mod tests {
             config_path: String::new(),
             router_path: String::new(),
             stats_path: String::new(),
+            deepseek_balance_path: String::new(),
             serial_channel_locks: Mutex::new(Default::default()),
         });
-        let attempts =
-            build_attempts(&state, &channels, &router, &decision, ApiProtocol::OpenAI).await;
+        let attempts = build_attempts(
+            &state,
+            &channels,
+            &router,
+            &decision,
+            ApiProtocol::OpenAI,
+            false,
+        )
+        .await;
 
         assert_eq!(attempts.first().unwrap().channel.name, "Gemini");
         assert_eq!(attempts.first().unwrap().actual_model, "gemini-3.5-flash");
@@ -2746,7 +3052,7 @@ mod tests {
         RouteProfile::gemini_stack().apply_to(&mut router);
         let decision = RouteDecision {
             requested_model: "deepseek-v4-flash".to_string(),
-            desired_model: "LongCat-Flash-Chat".to_string(),
+            desired_model: "LongCat-2.0-Preview".to_string(),
             role: "emergency".to_string(),
             group: "longcat".to_string(),
             reason: "rule free-health-and-memory".to_string(),
@@ -2754,8 +3060,8 @@ mod tests {
         let channels = vec![
             Channel {
                 name: "LongCat".to_string(),
-                models: "LongCat-Flash-Chat".to_string(),
-                model_mapping: r#"{"deepseek-v4-flash":"LongCat-Flash-Chat"}"#.to_string(),
+                models: "LongCat-2.0-Preview".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"LongCat-2.0-Preview"}"#.to_string(),
                 role: "emergency".to_string(),
                 group: "longcat".to_string(),
                 priority: 10,
@@ -2780,15 +3086,26 @@ mod tests {
             config_path: String::new(),
             router_path: String::new(),
             stats_path: String::new(),
+            deepseek_balance_path: String::new(),
             serial_channel_locks: Mutex::new(Default::default()),
         });
 
-        let attempts =
-            build_attempts(&state, &channels, &router, &decision, ApiProtocol::OpenAI).await;
+        let attempts = build_attempts(
+            &state,
+            &channels,
+            &router,
+            &decision,
+            ApiProtocol::OpenAI,
+            false,
+        )
+        .await;
 
         assert_eq!(attempts.first().unwrap().channel.name, "LongCat");
         assert_eq!(attempts.first().unwrap().group, "longcat");
-        assert_eq!(attempts.first().unwrap().actual_model, "LongCat-Flash-Chat");
+        assert_eq!(
+            attempts.first().unwrap().actual_model,
+            "LongCat-2.0-Preview"
+        );
     }
 
     #[tokio::test]
@@ -2797,7 +3114,7 @@ mod tests {
         RouteProfile::gemini_stack().apply_to(&mut router);
         let decision = RouteDecision {
             requested_model: "deepseek-v4-flash".to_string(),
-            desired_model: "LongCat-Flash-Chat".to_string(),
+            desired_model: "LongCat-2.0-Preview".to_string(),
             role: "emergency".to_string(),
             group: "longcat".to_string(),
             reason: "rule free-health-and-memory: free task pattern matched".to_string(),
@@ -2805,8 +3122,8 @@ mod tests {
         let channels = vec![
             Channel {
                 name: "LongCat".to_string(),
-                models: "LongCat-Flash-Chat".to_string(),
-                model_mapping: r#"{"deepseek-v4-flash":"LongCat-Flash-Chat"}"#.to_string(),
+                models: "LongCat-2.0-Preview".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"LongCat-2.0-Preview"}"#.to_string(),
                 role: "emergency".to_string(),
                 group: "longcat".to_string(),
                 priority: 10,
@@ -2831,11 +3148,19 @@ mod tests {
             config_path: String::new(),
             router_path: String::new(),
             stats_path: String::new(),
+            deepseek_balance_path: String::new(),
             serial_channel_locks: Mutex::new(Default::default()),
         });
 
-        let attempts =
-            build_attempts(&state, &channels, &router, &decision, ApiProtocol::OpenAI).await;
+        let attempts = build_attempts(
+            &state,
+            &channels,
+            &router,
+            &decision,
+            ApiProtocol::OpenAI,
+            false,
+        )
+        .await;
 
         assert_eq!(attempts.len(), 1);
         assert_eq!(attempts[0].channel.name, "LongCat");
@@ -2886,9 +3211,9 @@ mod tests {
             "default-nanobot",
         );
 
-        assert_eq!(decision.role, "emergency");
-        assert_eq!(decision.group, "longcat");
-        assert_eq!(decision.desired_model, "LongCat-Flash-Chat");
+        assert_eq!(decision.role, "default");
+        assert_eq!(decision.group, "gemini");
+        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
     }
 
     #[test]
@@ -2925,14 +3250,129 @@ mod tests {
 
         let routed = apply_gemini_health_route(&router, &stats, decision);
 
-        assert_eq!(routed.role, "backup");
+        assert_eq!(routed.role, "emergency");
         assert_eq!(routed.group, "gemini");
         assert_eq!(routed.desired_model, "gemini-3.1-flash-lite");
         assert!(routed.reason.contains("rolling health"));
     }
 
+    #[test]
+    fn detects_stale_gemini_failure_text() {
+        assert!(gemini_stale_failure_text(
+            "Gemini request failed: Gemini API error code: 1099"
+        ));
+        assert!(gemini_stale_failure_text(
+            "\u{60a8}\u{767b}\u{5f55}\u{4e86}\u{5417}\u{ff1f}\u{6211}\u{53ef}\u{4ee5}\u{641c}\u{7d22}\u{56fe}\u{7247}\u{ff0c}\u{4f46}\u{76ee}\u{524d}\u{4f3c}\u{4e4e}\u{65e0}\u{6cd5}\u{4e3a}\u{60a8}\u{521b}\u{5efa}\u{4efb}\u{4f55}\u{56fe}\u{7247}"
+        ));
+        assert!(!gemini_stale_failure_text(
+            "\u{6211}\u{53ef}\u{4ee5}\u{5e2e}\u{4f60}\u{5206}\u{6790}\u{4eca}\u{5929}\u{8fd9}\u{4e2a}\u{9009}\u{62e9}"
+        ));
+        assert!(!gemini_stale_failure_text(
+            "Gemini can analyze this image correctly"
+        ));
+    }
+
+    #[test]
+    fn extracts_stream_probe_text_from_openai_sse() {
+        let mut buf = String::new();
+        let text = sse_chunk_output_text(
+            &mut buf,
+            br#"data: {"choices":[{"delta":{"content":"hello"}}]}
+
+"#,
+        );
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn detects_obp_image_generation_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-obp-image-generation", "1".parse().unwrap());
+        assert!(header_truthy(&headers, "x-obp-image-generation"));
+
+        headers.insert("x-obp-image-generation", "false".parse().unwrap());
+        assert!(!header_truthy(&headers, "x-obp-image-generation"));
+    }
+
+    #[test]
+    fn detects_image_generation_from_latest_user_only() {
+        let request = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role":"user", "content":"\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{7ea2}\u{8272}\u{5706}\u{5f62}\u{56fe}\u{6807}"},
+                {"role":"assistant", "content":"ok"},
+                {"role":"user", "content":"\u{751f}\u{56fe}\u{8fd8}\u{6709}\u{62a5}\u{9519}\u{ff0c}\u{770b}\u{770b}\u{600e}\u{4e48}\u{529e}"}
+            ]
+        });
+        assert!(!request_wants_image_generation(Some(&request)));
+
+        let request = serde_json::json!({
+            "model": "deepseek-v4-flash",
+            "messages": [
+                {"role":"user", "content":"\u{7ed9}\u{6211}\u{753b}\u{4e00}\u{5f20}\u{7ea2}\u{8272}\u{5706}\u{5f62}\u{56fe}\u{6807}"}
+            ]
+        });
+        assert!(request_wants_image_generation(Some(&request)));
+    }
+
     #[tokio::test]
-    async fn gemini_fallbacks_do_not_leak_to_deepseek() {
+    async fn image_generation_requests_use_single_attempt() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let decision = RouteDecision {
+            requested_model: "deepseek-v4-flash".to_string(),
+            desired_model: router.default_model.clone(),
+            role: "default".to_string(),
+            group: "gemini".to_string(),
+            reason: "default lightweight route".to_string(),
+        };
+        let channels = vec![
+            Channel {
+                id: Some(1),
+                name: "Gemini Default".to_string(),
+                models: "gemini-3.5-flash".to_string(),
+                role: "default".to_string(),
+                group: "gemini".to_string(),
+                priority: 10,
+                ..Channel::default()
+            },
+            Channel {
+                id: Some(2),
+                name: "Gemini Backup".to_string(),
+                models: "gemini-3-flash".to_string(),
+                role: "backup".to_string(),
+                group: "gemini".to_string(),
+                priority: 20,
+                ..Channel::default()
+            },
+        ];
+        let state = Arc::new(ProxyState {
+            client: Client::new(),
+            channels: Mutex::new(vec![]),
+            router: Mutex::new(router.clone()),
+            stats: Mutex::new(UsageStats::default()),
+            index: Mutex::new(0),
+            config_path: String::new(),
+            router_path: String::new(),
+            stats_path: String::new(),
+            deepseek_balance_path: String::new(),
+            serial_channel_locks: Mutex::new(Default::default()),
+        });
+        let attempts = build_attempts(
+            &state,
+            &channels,
+            &router,
+            &decision,
+            ApiProtocol::OpenAI,
+            true,
+        )
+        .await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].stage, "primary");
+    }
+
+    #[tokio::test]
+    async fn gemini_fallbacks_use_deepseek_only_as_backup() {
         let mut router = RouterConfig::default();
         RouteProfile::gemini_stack().apply_to(&mut router);
         let decision = RouteDecision {
@@ -2952,9 +3392,9 @@ mod tests {
                 ..Channel::default()
             },
             Channel {
-                name: "DeepSeek".to_string(),
+                name: "DeepSeek Backup".to_string(),
                 models: "deepseek-v4-flash".to_string(),
-                role: "default".to_string(),
+                role: "backup".to_string(),
                 group: "deepseek".to_string(),
                 priority: 1,
                 ..Channel::default()
@@ -2969,16 +3409,29 @@ mod tests {
             config_path: String::new(),
             router_path: String::new(),
             stats_path: String::new(),
+            deepseek_balance_path: String::new(),
             serial_channel_locks: Mutex::new(Default::default()),
         });
 
-        let attempts =
-            build_attempts(&state, &channels, &router, &decision, ApiProtocol::OpenAI).await;
+        let attempts = build_attempts(
+            &state,
+            &channels,
+            &router,
+            &decision,
+            ApiProtocol::OpenAI,
+            false,
+        )
+        .await;
 
         assert!(!attempts.is_empty());
-        assert!(attempts.iter().all(|attempt| attempt.group == "gemini"));
-        assert!(attempts
-            .iter()
-            .all(|attempt| attempt.channel.group_key() == "gemini"));
+        assert_eq!(attempts[0].group, "gemini");
+        assert!(attempts.iter().any(|attempt| {
+            attempt.role == "backup"
+                && attempt.group == "deepseek"
+                && attempt.channel.group_key() == "deepseek"
+        }));
+        assert!(attempts.iter().all(|attempt| {
+            attempt.group == "gemini" || (attempt.role == "backup" && attempt.group == "deepseek")
+        }));
     }
 }

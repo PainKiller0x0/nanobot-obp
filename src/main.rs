@@ -1,14 +1,16 @@
 mod config;
+mod deepseek_balance;
 mod proxy;
 mod stats;
 
 use crate::config::{
     load_config, load_router_config, save_config, save_router_config, Channel, RouterConfig,
 };
+use crate::deepseek_balance::{deepseek_balance_report, DeepSeekBalanceQuery};
 use crate::proxy::{handle_anthropic_proxy, handle_openai_proxy, ProxyState};
 use crate::stats::{load_stats, pricing_snapshot, save_stats, UsageStats};
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::header,
     response::{Html, IntoResponse},
     routing::{get, post, put},
@@ -24,6 +26,7 @@ use tokio::sync::Mutex;
 const CONFIG_PATH: &str = "data/config.json";
 const ROUTER_PATH: &str = "data/router.json";
 const STATS_PATH: &str = "data/stats.json";
+const DEEPSEEK_BALANCE_PATH: &str = "data/deepseek_balance.json";
 
 #[tokio::main]
 async fn main() {
@@ -33,6 +36,8 @@ async fn main() {
     let config_path = env::var("OBP_CONFIG_PATH").unwrap_or_else(|_| CONFIG_PATH.to_string());
     let router_path = env::var("OBP_ROUTER_PATH").unwrap_or_else(|_| ROUTER_PATH.to_string());
     let stats_path = env::var("OBP_STATS_PATH").unwrap_or_else(|_| STATS_PATH.to_string());
+    let deepseek_balance_path =
+        env::var("OBP_DEEPSEEK_BALANCE_PATH").unwrap_or_else(|_| DEEPSEEK_BALANCE_PATH.to_string());
     let channels = load_config(&config_path);
     let router = load_router_config(&router_path);
     let stats = load_stats(&stats_path);
@@ -48,6 +53,7 @@ async fn main() {
         config_path,
         router_path,
         stats_path,
+        deepseek_balance_path,
         serial_channel_locks: Mutex::new(Default::default()),
     });
 
@@ -60,6 +66,7 @@ async fn main() {
         .route("/admin/channels", get(get_channels).post(add_channel))
         .route("/admin/channels/test", post(test_channel))
         .route("/admin/stats", get(get_stats).delete(clear_stats))
+        .route("/admin/deepseek/balance", get(get_deepseek_balance))
         .route("/admin/router", get(get_router).put(update_router))
         .route(
             "/admin/channels/{id}",
@@ -152,6 +159,28 @@ async fn clear_stats(State(state): State<Arc<ProxyState>>) -> Json<serde_json::V
     *stats = UsageStats::default();
     save_stats(&state.stats_path, &stats);
     Json(serde_json::json!({ "status": "ok" }))
+}
+
+async fn get_deepseek_balance(
+    State(state): State<Arc<ProxyState>>,
+    Query(query): Query<DeepSeekBalanceQuery>,
+) -> Json<serde_json::Value> {
+    let channels = state.channels.lock().await.clone();
+    let stats = state.stats.lock().await.clone();
+    let report = deepseek_balance_report(
+        &state.client,
+        &channels,
+        &stats,
+        &state.deepseek_balance_path,
+        query.refresh,
+    )
+    .await;
+    Json(serde_json::to_value(report).unwrap_or_else(|_| {
+        serde_json::json!({
+            "ok": false,
+            "message": "DeepSeek ?????????"
+        })
+    }))
 }
 
 async fn get_router(State(state): State<Arc<ProxyState>>) -> Json<RouterConfig> {

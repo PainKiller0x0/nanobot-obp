@@ -5,21 +5,21 @@
   "external_allowed_models": [
     "deepseek-v4-flash",
     "deepseek-v4-pro",
-    "MiniMax-M2.7",
-    "LongCat-Flash-Chat",
     "gemini-flash",
     "gemini-pro",
     "gemini-3.5-flash",
-    "gemini-3.1-pro"
+    "gemini-3.1-pro",
+    "gemini-3.1-flash-lite",
+    "gemini-web-thinking"
   ],
   "default_model": "deepseek-v4-flash",
   "pro_model": "deepseek-v4-pro",
-  "emergency_model": "LongCat-Flash-Chat",
-  "backup_model": "MiniMax-M2.7",
+  "emergency_model": "gemini-3.1-flash-lite",
+  "backup_model": "deepseek-v4-flash",
   "default_group": "deepseek",
   "pro_group": "deepseek",
-  "emergency_group": "longcat",
-  "backup_group": "minimax",
+  "emergency_group": "gemini",
+  "backup_group": "deepseek",
   "default_alias_models": [
     "deepseek-v4-flash",
     "gpt-4o-mini",
@@ -34,22 +34,22 @@
     "default": {
       "default_model": "deepseek-v4-flash",
       "pro_model": "deepseek-v4-pro",
-      "emergency_model": "LongCat-Flash-Chat",
-      "backup_model": "MiniMax-M2.7",
+      "emergency_model": "gemini-3.1-flash-lite",
+      "backup_model": "deepseek-v4-flash",
       "default_group": "deepseek",
       "pro_group": "deepseek",
-      "emergency_group": "longcat",
-      "backup_group": "minimax"
+      "emergency_group": "gemini",
+      "backup_group": "deepseek"
     },
     "gemini": {
-      "default_model": "gemini-flash",
-      "pro_model": "gemini-pro",
-      "emergency_model": "gemini-flash",
-      "backup_model": "gemini-flash",
+      "default_model": "gemini-3.5-flash",
+      "pro_model": "gemini-3.1-pro",
+      "emergency_model": "gemini-3.1-flash-lite",
+      "backup_model": "deepseek-v4-flash",
       "default_group": "gemini",
       "pro_group": "gemini",
       "emergency_group": "gemini",
-      "backup_group": "gemini"
+      "backup_group": "deepseek"
     }
   },
   "source_route_profiles": {

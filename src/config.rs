@@ -113,11 +113,11 @@ impl Channel {
         if let Some(mapped) = lookup_mapping(mapping.as_ref(), desired_model) {
             return mapped;
         }
-        if let Some(mapped) = lookup_mapping(mapping.as_ref(), requested_model) {
-            return mapped;
-        }
         if !desired_model.trim().is_empty() && self.supports_model(desired_model) {
             return desired_model.to_string();
+        }
+        if let Some(mapped) = lookup_mapping(mapping.as_ref(), requested_model) {
+            return mapped;
         }
         if !requested_model.trim().is_empty() && self.supports_model(requested_model) {
             return requested_model.to_string();
@@ -181,6 +181,7 @@ pub struct RouteProfile {
     pub pro_group: String,
     pub emergency_group: String,
     pub backup_group: String,
+    pub pro_timeout_ms: u64,
 }
 
 impl RouteProfile {
@@ -188,12 +189,13 @@ impl RouteProfile {
         Self {
             default_model: "deepseek-v4-flash".to_string(),
             pro_model: "deepseek-v4-pro".to_string(),
-            emergency_model: "LongCat-Flash-Chat".to_string(),
-            backup_model: "MiniMax-M2.7".to_string(),
+            emergency_model: "gemini-3.1-flash-lite".to_string(),
+            backup_model: "deepseek-v4-flash".to_string(),
             default_group: "deepseek".to_string(),
             pro_group: "deepseek".to_string(),
-            emergency_group: "longcat".to_string(),
-            backup_group: "minimax".to_string(),
+            emergency_group: "gemini".to_string(),
+            backup_group: "deepseek".to_string(),
+            pro_timeout_ms: 20_000,
         }
     }
 
@@ -202,11 +204,12 @@ impl RouteProfile {
             default_model: "gemini-3.5-flash".to_string(),
             pro_model: "gemini-3.1-pro".to_string(),
             emergency_model: "gemini-3.1-flash-lite".to_string(),
-            backup_model: "gemini-3.1-flash-lite".to_string(),
+            backup_model: "deepseek-v4-flash".to_string(),
             default_group: "gemini".to_string(),
             pro_group: "gemini".to_string(),
             emergency_group: "gemini".to_string(),
-            backup_group: "gemini".to_string(),
+            backup_group: "deepseek".to_string(),
+            pro_timeout_ms: 20_000,
         }
     }
 
@@ -299,6 +302,7 @@ pub struct RouterConfig {
     pub monthly_hard_limit_rmb: f64,
     pub retry_statuses: Vec<u16>,
     pub pro_keywords: Vec<String>,
+    pub pro_timeout_ms: u64,
 }
 
 impl Default for RouterConfig {
@@ -310,17 +314,18 @@ impl Default for RouterConfig {
             external_allowed_models: vec![
                 "deepseek-v4-flash".to_string(),
                 "deepseek-v4-pro".to_string(),
-                "MiniMax-M2.7".to_string(),
-                "LongCat-Flash-Chat".to_string(),
+                "gemini-3.5-flash".to_string(),
+                "gemini-3.1-pro".to_string(),
+                "gemini-3.1-flash-lite".to_string(),
             ],
             default_model: "deepseek-v4-flash".to_string(),
             pro_model: "deepseek-v4-pro".to_string(),
-            emergency_model: "LongCat-Flash-Chat".to_string(),
-            backup_model: "coding-plan".to_string(),
+            emergency_model: "gemini-3.1-flash-lite".to_string(),
+            backup_model: "deepseek-v4-flash".to_string(),
             default_group: "deepseek".to_string(),
             pro_group: "deepseek".to_string(),
-            emergency_group: "longcat".to_string(),
-            backup_group: String::new(),
+            emergency_group: "gemini".to_string(),
+            backup_group: "deepseek".to_string(),
             default_alias_models: vec![
                 "deepseek-v4-flash".to_string(),
                 "gpt-4o-mini".to_string(),
@@ -360,6 +365,7 @@ impl Default for RouterConfig {
                 "上下文压缩".to_string(),
                 "反思".to_string(),
             ],
+            pro_timeout_ms: 20_000,
         }
     }
 }
@@ -432,9 +438,9 @@ fn default_route_rules() -> Vec<RouteRule> {
         RouteRule {
             name: "free-health-and-memory".to_string(),
             priority: 10,
-            role: "emergency".to_string(),
-            model: "LongCat-Flash-Chat".to_string(),
-            group: "longcat".to_string(),
+            role: "default".to_string(),
+            model: "gemini-3.1-flash-lite".to_string(),
+            group: "gemini".to_string(),
             reason: "free task pattern matched".to_string(),
             hint_patterns: vec![
                 "heartbeat".to_string(),

@@ -59,16 +59,16 @@
     "type": "openai",
     "key": "YOUR_API_KEY",
     "base": "https://api.longcat.chat/openai",
-    "models": "LongCat-Flash-Chat",
-    "model_mapping": "{\"gpt-4o\": \"LongCat-Flash-Chat\", \"gpt-4o-mini\": \"LongCat-Flash-Chat\", \"gpt-3.5-turbo\": \"LongCat-Flash-Chat\", \"deepseek-v4-flash\": \"LongCat-Flash-Chat\", \"deepseek-v4-pro\": \"LongCat-Flash-Chat\", \"gemini-flash\": \"LongCat-Flash-Chat\", \"gemini-pro\": \"LongCat-Flash-Chat\", \"coding-plan\": \"LongCat-Flash-Chat\"}",
-    "status": "active",
+    "models": "LongCat-2.0-Preview",
+    "model_mapping": "{\"gpt-4o\": \"LongCat-2.0-Preview\", \"gpt-4o-mini\": \"LongCat-2.0-Preview\", \"gpt-3.5-turbo\": \"LongCat-2.0-Preview\", \"deepseek-v4-flash\": \"LongCat-2.0-Preview\", \"deepseek-v4-pro\": \"LongCat-2.0-Preview\", \"gemini-flash\": \"LongCat-2.0-Preview\", \"gemini-pro\": \"LongCat-2.0-Preview\", \"coding-plan\": \"LongCat-2.0-Preview\", \"LongCat-Flash-Chat\": \"LongCat-2.0-Preview\"}",
+    "status": "disabled",
     "requests": 0,
     "last_test": null,
     "fail_count": 0,
     "disabled_until": null,
-    "role": "emergency",
+    "role": "backup",
     "group": "longcat",
-    "priority": 100,
+    "priority": 999,
     "cost_model": "longcat"
   },
   {
@@ -79,14 +79,14 @@
     "base": "https://api.minimaxi.com/v1",
     "models": "MiniMax-M2.7",
     "model_mapping": "{\"coding-plan\": \"MiniMax-M2.7\", \"gpt-4o\": \"MiniMax-M2.7\", \"gpt-4o-mini\": \"MiniMax-M2.7\"}",
-    "status": "active",
+    "status": "disabled",
     "requests": 0,
     "last_test": null,
     "fail_count": 0,
     "disabled_until": null,
     "role": "backup",
     "group": "minimax",
-    "priority": 100,
+    "priority": 999,
     "cost_model": "minimax-m27"
   }
 ]
