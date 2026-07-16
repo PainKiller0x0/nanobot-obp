@@ -601,7 +601,7 @@ async fn handle_proxy(
     let decision = if image_generation_request {
         decision
     } else {
-        apply_gemini_health_route(&effective_router, &stats, decision)
+        apply_gemini_health_route(&effective_router, &stats, decision, &source)
     };
     let free_task_timeout = free_task_timeout(&decision);
     let pro_timeout = pro_response_timeout(&decision, &effective_router);
@@ -1254,9 +1254,15 @@ fn choice_output_text(choice: &Value) -> String {
 }
 
 fn gemini_stale_failure_text(text: &str) -> bool {
+    let text = text.trim();
+    // The Web UI sometimes returns a short, canned failure message.  Do not
+    // reject a real answer merely because it discusses an earlier Gemini error.
+    if text.len() > 480 {
+        return false;
+    }
     let lower = text.to_lowercase();
     let api_error =
-        lower.contains("gemini request failed:") || lower.contains("gemini api error code:");
+        lower.starts_with("gemini request failed:") || lower.starts_with("gemini api error code:");
     let chinese_hit = text.contains("\u{53ef}\u{4ee5}\u{641c}\u{7d22}\u{56fe}\u{7247}")
         && (text.contains("\u{65e0}\u{6cd5}\u{4e3a}\u{60a8}\u{521b}\u{5efa}")
             || text.contains("\u{5f00}\u{901a}\u{56fe}\u{7247}\u{521b}\u{5efa}"));
@@ -1269,6 +1275,7 @@ fn apply_gemini_health_route(
     router: &RouterConfig,
     stats: &UsageStats,
     decision: RouteDecision,
+    source: &str,
 ) -> RouteDecision {
     if !gemini_health_routing_enabled()
         || !decision.group.eq_ignore_ascii_case("gemini")
@@ -1287,7 +1294,7 @@ fn apply_gemini_health_route(
         return decision;
     }
 
-    let Some(summary) = gemini_health_slow_reason(stats, &decision.desired_model) else {
+    let Some(summary) = gemini_health_slow_reason(stats, &decision.desired_model, source) else {
         return decision;
     };
 
@@ -1309,11 +1316,16 @@ fn gemini_health_routing_enabled() -> bool {
         .unwrap_or(true)
 }
 
-fn gemini_health_slow_reason(stats: &UsageStats, model: &str) -> Option<String> {
+fn gemini_health_slow_reason(stats: &UsageStats, model: &str, source: &str) -> Option<String> {
     let window = env_u64("OBP_GEMINI_HEALTH_WINDOW", 30) as usize;
     let min_samples = env_u64("OBP_GEMINI_HEALTH_MIN_SAMPLES", 12) as usize;
     let p95_threshold = env_u64("OBP_GEMINI_HEALTH_P95_MS", 8_000);
     let max_threshold = env_u64("OBP_GEMINI_HEALTH_MAX_MS", 15_000);
+    let max_age_seconds = env_u64("OBP_GEMINI_HEALTH_MAX_AGE_SECONDS", 900);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or(0);
     let mut samples: Vec<u64> = stats
         .recent
         .iter()
@@ -1321,6 +1333,8 @@ fn gemini_health_slow_reason(stats: &UsageStats, model: &str) -> Option<String> 
         .filter(|log| (200..400).contains(&log.status))
         .filter(|log| log.route_profile.eq_ignore_ascii_case("gemini"))
         .filter(|log| model_eq(&log.model, model))
+        .filter(|log| log.source.eq_ignore_ascii_case(source))
+        .filter(|log| now.saturating_sub(log.ts) <= max_age_seconds as i64)
         .filter_map(|log| log.first_text_ms)
         .take(window.max(1))
         .collect();
@@ -1333,11 +1347,13 @@ fn gemini_health_slow_reason(stats: &UsageStats, model: &str) -> Option<String> 
     let max = *samples.last().unwrap_or(&0);
     if p95 >= p95_threshold || max >= max_threshold {
         Some(format!(
-            "model={} samples={} p95={}ms max={}ms",
+            "model={} source={} samples={} p95={}ms max={}ms age<={}s",
             model,
+            source,
             samples.len(),
             p95,
-            max
+            max,
+            max_age_seconds,
         ))
     } else {
         None
@@ -3248,12 +3264,50 @@ mod tests {
             reason: "default lightweight route".to_string(),
         };
 
-        let routed = apply_gemini_health_route(&router, &stats, decision);
+        let routed = apply_gemini_health_route(&router, &stats, decision, "default-nanobot");
 
         assert_eq!(routed.role, "emergency");
         assert_eq!(routed.group, "gemini");
         assert_eq!(routed.desired_model, "gemini-3.1-flash-lite");
         assert!(routed.reason.contains("rolling health"));
+    }
+
+    #[test]
+    fn gemini_health_does_not_cross_source_boundaries() {
+        let mut router = RouterConfig::default();
+        RouteProfile::gemini_stack().apply_to(&mut router);
+        let mut stats = UsageStats::default();
+        for idx in 0..12 {
+            stats.record(RequestLog::new(
+                format!("other-{idx}"),
+                "trend-radar".to_string(),
+                Some(1),
+                "Gemini".to_string(),
+                "default".to_string(),
+                "gemini-3.5-flash".to_string(),
+                "default".to_string(),
+                "slow".to_string(),
+                "gemini".to_string(),
+                "primary".to_string(),
+                200,
+                20_000,
+                TokenUsage::default(),
+                Some(500),
+                Some(20_000),
+            ));
+        }
+        let decision = RouteDecision {
+            requested_model: "default".to_string(),
+            desired_model: "gemini-3.5-flash".to_string(),
+            role: "default".to_string(),
+            group: "gemini".to_string(),
+            reason: "default lightweight route".to_string(),
+        };
+
+        let routed = apply_gemini_health_route(&router, &stats, decision, "default-nanobot");
+
+        assert_eq!(routed.desired_model, "gemini-3.5-flash");
+        assert_eq!(routed.role, "default");
     }
 
     #[test]
@@ -3269,6 +3323,9 @@ mod tests {
         ));
         assert!(!gemini_stale_failure_text(
             "Gemini can analyze this image correctly"
+        ));
+        assert!(!gemini_stale_failure_text(
+            "I saw the earlier Gemini request failed: Gemini API error code: 1099, but the new response is valid and can continue with the requested analysis. This explanation is intentionally long enough to represent a normal conversational answer rather than the short canned failure message returned by Gemini Web."
         ));
     }
 
