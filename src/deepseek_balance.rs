@@ -301,7 +301,7 @@ fn positive_delta(before: f64, after: f64) -> Option<f64> {
     if delta.abs() < 0.000_001 {
         Some(0.0)
     } else {
-        Some(delta)  // 负数表示充值导致余额增加，不截断
+        Some(delta) // 负数表示充值导致余额增加，不截断
     }
 }
 
