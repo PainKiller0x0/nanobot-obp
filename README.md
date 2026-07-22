@@ -72,7 +72,7 @@ Anthropic 兼容格式：
 curl http://127.0.0.1:8000/anthropic/v1/messages \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.6-flash",
     "max_tokens": 1024,
     "messages": [
       {"role": "user", "content": "你好"}

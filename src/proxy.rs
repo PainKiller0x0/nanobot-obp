@@ -1267,7 +1267,10 @@ fn gemini_stale_failure_text(text: &str) -> bool {
         && (text.contains("\u{65e0}\u{6cd5}\u{4e3a}\u{60a8}\u{521b}\u{5efa}")
             || text.contains("\u{5f00}\u{901a}\u{56fe}\u{7247}\u{521b}\u{5efa}"));
     let english_hit = lower.contains("can search for images")
-        && (lower.contains("can't create") || lower.contains("cannot create"));
+        && (lower.contains("can't create")
+            || lower.contains("can't seem to create")
+            || lower.contains("cannot create")
+            || lower.contains("image creation isn't available"));
     api_error || chinese_hit || english_hit
 }
 
@@ -2851,7 +2854,7 @@ mod tests {
 
         assert_eq!(decision.role, "default");
         assert_eq!(decision.group, "gemini");
-        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
+        assert_eq!(decision.desired_model, "gemini-3.5-flash-lite");
         assert!(decision.reason.contains("free task"));
     }
 
@@ -2924,7 +2927,7 @@ mod tests {
 
         assert_eq!(decision.role, "default");
         assert_eq!(decision.group, "gemini");
-        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
+        assert_eq!(decision.desired_model, "gemini-3.5-flash-lite");
     }
 
     #[test]
@@ -2952,7 +2955,7 @@ mod tests {
 
         assert_eq!(decision.role, "default");
         assert_eq!(decision.group, "gemini");
-        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
+        assert_eq!(decision.desired_model, "gemini-3.5-flash-lite");
         assert!(decision.reason.contains("extract key facts"));
     }
 
@@ -2980,7 +2983,7 @@ mod tests {
             "default-nanobot",
         );
 
-        assert_eq!(decision.desired_model, "gemini-3.5-flash");
+        assert_eq!(decision.desired_model, "gemini-3.6-flash");
         assert_eq!(decision.group, "gemini");
     }
 
@@ -3028,8 +3031,8 @@ mod tests {
             },
             Channel {
                 name: "Gemini".to_string(),
-                models: "gemini-3.5-flash,gemini-flash".to_string(),
-                model_mapping: r#"{"gemini-flash":"gemini-3.5-flash"}"#.to_string(),
+                models: "gemini-3.6-flash,gemini-flash".to_string(),
+                model_mapping: r#"{"gemini-flash":"gemini-3.6-flash"}"#.to_string(),
                 role: "backup".to_string(),
                 group: "gemini".to_string(),
                 priority: 90,
@@ -3059,7 +3062,7 @@ mod tests {
         .await;
 
         assert_eq!(attempts.first().unwrap().channel.name, "Gemini");
-        assert_eq!(attempts.first().unwrap().actual_model, "gemini-3.5-flash");
+        assert_eq!(attempts.first().unwrap().actual_model, "gemini-3.6-flash");
     }
 
     #[tokio::test]
@@ -3085,8 +3088,8 @@ mod tests {
             },
             Channel {
                 name: "Gemini".to_string(),
-                models: "deepseek-v4-flash,gemini-3.1-flash-lite".to_string(),
-                model_mapping: r#"{"deepseek-v4-flash":"gemini-3.1-flash-lite"}"#.to_string(),
+                models: "deepseek-v4-flash,gemini-3.5-flash-lite".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"gemini-3.5-flash-lite"}"#.to_string(),
                 role: "emergency".to_string(),
                 group: "gemini".to_string(),
                 priority: 20,
@@ -3147,8 +3150,8 @@ mod tests {
             },
             Channel {
                 name: "Gemini".to_string(),
-                models: "deepseek-v4-flash,gemini-3.1-flash-lite".to_string(),
-                model_mapping: r#"{"deepseek-v4-flash":"gemini-3.1-flash-lite"}"#.to_string(),
+                models: "deepseek-v4-flash,gemini-3.5-flash-lite".to_string(),
+                model_mapping: r#"{"deepseek-v4-flash":"gemini-3.5-flash-lite"}"#.to_string(),
                 role: "emergency".to_string(),
                 group: "gemini".to_string(),
                 priority: 20,
@@ -3229,7 +3232,7 @@ mod tests {
 
         assert_eq!(decision.role, "default");
         assert_eq!(decision.group, "gemini");
-        assert_eq!(decision.desired_model, "gemini-3.1-flash-lite");
+        assert_eq!(decision.desired_model, "gemini-3.5-flash-lite");
     }
 
     #[test]
@@ -3244,7 +3247,7 @@ mod tests {
                 Some(1),
                 "Gemini".to_string(),
                 "deepseek-v4-flash".to_string(),
-                "gemini-3.5-flash".to_string(),
+                "gemini-3.6-flash".to_string(),
                 "default".to_string(),
                 "default lightweight route".to_string(),
                 "gemini".to_string(),
@@ -3258,7 +3261,7 @@ mod tests {
         }
         let decision = RouteDecision {
             requested_model: "deepseek-v4-flash".to_string(),
-            desired_model: "gemini-3.5-flash".to_string(),
+            desired_model: "gemini-3.6-flash".to_string(),
             role: "default".to_string(),
             group: "gemini".to_string(),
             reason: "default lightweight route".to_string(),
@@ -3268,7 +3271,7 @@ mod tests {
 
         assert_eq!(routed.role, "emergency");
         assert_eq!(routed.group, "gemini");
-        assert_eq!(routed.desired_model, "gemini-3.1-flash-lite");
+        assert_eq!(routed.desired_model, "gemini-3.5-flash-lite");
         assert!(routed.reason.contains("rolling health"));
     }
 
@@ -3284,7 +3287,7 @@ mod tests {
                 Some(1),
                 "Gemini".to_string(),
                 "default".to_string(),
-                "gemini-3.5-flash".to_string(),
+                "gemini-3.6-flash".to_string(),
                 "default".to_string(),
                 "slow".to_string(),
                 "gemini".to_string(),
@@ -3298,7 +3301,7 @@ mod tests {
         }
         let decision = RouteDecision {
             requested_model: "default".to_string(),
-            desired_model: "gemini-3.5-flash".to_string(),
+            desired_model: "gemini-3.6-flash".to_string(),
             role: "default".to_string(),
             group: "gemini".to_string(),
             reason: "default lightweight route".to_string(),
@@ -3306,7 +3309,7 @@ mod tests {
 
         let routed = apply_gemini_health_route(&router, &stats, decision, "default-nanobot");
 
-        assert_eq!(routed.desired_model, "gemini-3.5-flash");
+        assert_eq!(routed.desired_model, "gemini-3.6-flash");
         assert_eq!(routed.role, "default");
     }
 
@@ -3317,6 +3320,9 @@ mod tests {
         ));
         assert!(gemini_stale_failure_text(
             "\u{60a8}\u{767b}\u{5f55}\u{4e86}\u{5417}\u{ff1f}\u{6211}\u{53ef}\u{4ee5}\u{641c}\u{7d22}\u{56fe}\u{7247}\u{ff0c}\u{4f46}\u{76ee}\u{524d}\u{4f3c}\u{4e4e}\u{65e0}\u{6cd5}\u{4e3a}\u{60a8}\u{521b}\u{5efa}\u{4efb}\u{4f55}\u{56fe}\u{7247}"
+        ));
+        assert!(gemini_stale_failure_text(
+            "Are you signed in? I can search for images, but can't seem to create any for you right now. It's also possible that image creation isn't available in your location yet."
         ));
         assert!(!gemini_stale_failure_text(
             "\u{6211}\u{53ef}\u{4ee5}\u{5e2e}\u{4f60}\u{5206}\u{6790}\u{4eca}\u{5929}\u{8fd9}\u{4e2a}\u{9009}\u{62e9}"
@@ -3387,7 +3393,7 @@ mod tests {
             Channel {
                 id: Some(1),
                 name: "Gemini Default".to_string(),
-                models: "gemini-3.5-flash".to_string(),
+                models: "gemini-3.6-flash".to_string(),
                 role: "default".to_string(),
                 group: "gemini".to_string(),
                 priority: 10,
@@ -3434,7 +3440,7 @@ mod tests {
         RouteProfile::gemini_stack().apply_to(&mut router);
         let decision = RouteDecision {
             requested_model: "deepseek-v4-flash".to_string(),
-            desired_model: "gemini-3.5-flash".to_string(),
+            desired_model: "gemini-3.6-flash".to_string(),
             role: "default".to_string(),
             group: "gemini".to_string(),
             reason: "default lightweight route".to_string(),
@@ -3442,7 +3448,7 @@ mod tests {
         let channels = vec![
             Channel {
                 name: "Gemini".to_string(),
-                models: "gemini-3.5-flash,gemini-3.1-flash-lite".to_string(),
+                models: "gemini-3.6-flash,gemini-3.5-flash-lite".to_string(),
                 role: "default".to_string(),
                 group: "gemini".to_string(),
                 priority: 10,
